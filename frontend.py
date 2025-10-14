@@ -22,6 +22,14 @@ import sqlite3
 import uuid
 import sys
 
+# ==================== EMAIL CONFIGURATION ====================
+EMAIL_CONFIG = {
+    'smtp_server': 'smtp.gmail.com',
+    'smtp_port': 587,
+    'sender_email': 'tasleemanasreenshaik09@gmail.com',  # Change this to your email
+    'sender_password': 'cjrw frib xssk lwsd'   # Change this to your app password
+}
+
 # ==================== PATH MANAGEMENT ====================
 def get_base_path():
     """Get the correct base path whether running as script or executable"""
@@ -66,6 +74,17 @@ class DatabaseManager:
                     attempt_time TEXT NOT NULL,
                     success INTEGER DEFAULT 0,
                     ip_address TEXT
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    token TEXT UNIQUE NOT NULL,
+                    expires_at REAL NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    used INTEGER DEFAULT 0
                 )
             ''')
             
@@ -193,15 +212,155 @@ class DatabaseManager:
         except Exception as e:
             print(f"Error getting security question: {e}")
             return None
-    
+
+    def get_user_by_email(self, email):
+        """Get user by email address"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT username, email FROM users WHERE email = ?", (email,))
+            result = cursor.fetchone()
+            
+            conn.close()
+            return result  # Returns (username, email) if found, None otherwise
+            
+        except Exception as e:
+            print(f"Error getting user by email: {e}")
+            return None
+
+    def update_password_by_email(self, email, new_password):
+        """Update user password by email"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            new_password_hash = self._hash_password(new_password)
+            cursor.execute("UPDATE users SET password_hash = ? WHERE email = ?", 
+                         (new_password_hash, email))
+            
+            conn.commit()
+            conn.close()
+            return True, "Password updated successfully"
+            
+        except Exception as e:
+            return False, f"Password update failed: {str(e)}"
+
     def _hash_password(self, password):
         """Hash password using SHA-256 with salt"""
         salt = "supraja_tech_2025"
         return hashlib.sha256((password + salt).encode()).hexdigest()
-    
+
     def _verify_password(self, password, stored_hash):
         """Verify password against stored hash"""
         return self._hash_password(password) == stored_hash
+
+    def create_password_reset_token(self, email):
+        """Create a password reset token for the user"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Generate a unique reset token
+            reset_token = str(uuid.uuid4())
+            expires_at = datetime.now().timestamp() + 3600  # 1 hour from now
+            
+            # Insert the reset token
+            cursor.execute('''
+                INSERT INTO password_reset_tokens (email, token, expires_at)
+                VALUES (?, ?, ?)
+            ''', (email, reset_token, expires_at))
+            
+            conn.commit()
+            conn.close()
+            return reset_token
+            
+        except Exception as e:
+            print(f"Error creating reset token: {e}")
+            return None
+
+    def verify_reset_token(self, token):
+        """Verify if a reset token is valid and not expired"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT email, expires_at, used FROM password_reset_tokens 
+                WHERE token = ? AND used = 0 AND expires_at > ?
+            ''', (token, datetime.now().timestamp()))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return True, result[0]  # Token is valid, return email
+            else:
+                return False, "Invalid or expired token"
+                
+        except Exception as e:
+            return False, f"Error verifying token: {e}"
+
+    def mark_token_used(self, token):
+        """Mark a reset token as used"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE password_reset_tokens SET used = 1 WHERE token = ?
+            ''', (token,))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error marking token as used: {e}")
+            return False
+        
+    def _assess_password_strength(self, password):
+        """Assess password strength (similar to PasswordManager method)"""
+        if not password:
+            return 0, "No password provided"
+        
+        common_passwords = {"password", "123456", "12345678", "1234", "qwerty"}
+        if password.lower() in common_passwords:
+            return 0, "Password is too common"
+        
+        score = 0
+        feedback = []
+        
+        if len(password) >= 8:
+            score += 1
+        else:
+            feedback.append("At least 8 characters")
+        
+        if any(c.isupper() for c in password):
+            score += 1
+        else:
+            feedback.append("Uppercase letters")
+        
+        if any(c.islower() for c in password):
+            score += 1
+        else:
+            feedback.append("Lowercase letters")
+        
+        if any(c.isdigit() for c in password):
+            score += 1
+        else:
+            feedback.append("Numbers")
+        
+        if any(not c.isalnum() for c in password):
+            score += 1
+        else:
+            feedback.append("Special characters")
+        
+        if score >= 5:
+            return score, "Strong password"
+        elif score >= 3:
+            return score, "Medium strength"
+        else:
+            return score, f"Weak: Add {', '.join(feedback[:2])}"
 
 # ==================== AUTHENTICATION MANAGER ====================
 class AuthManager:
@@ -264,7 +423,7 @@ class AuthManager:
     def get_security_question(self, username):
         """Get security question for password reset"""
         return self.db.get_security_question(username)
-    
+
     def set_current_user(self, username):
         """Set current logged in user"""
         self.current_user = username
@@ -276,6 +435,121 @@ class AuthManager:
     def logout(self):
         """Logout current user"""
         self.current_user = None
+    
+    def initiate_password_reset(self, email):
+        """Initiate password reset process with real email sending"""
+        user_data = self.db.get_user_by_email(email)
+        if not user_data:
+            return False, "No account found with this email address"
+        
+        username, user_email = user_data
+        
+        # Generate reset token
+        reset_token = self.db.create_password_reset_token(email)
+        if not reset_token:
+            return False, "Failed to create reset token"
+        
+        # Send reset email
+        success, message = self._send_password_reset_email(email, reset_token)
+        if success:
+            return True, f"Password reset instructions sent to {email}"
+        else:
+            return False, message
+
+    def _send_password_reset_email(self, email, reset_token):
+        """Send actual password reset email"""
+        try:
+            # Check if email credentials are configured
+            if (EMAIL_CONFIG['sender_email'] == 'your-email@gmail.com' or 
+                EMAIL_CONFIG['sender_password'] == 'your-app-password'):
+                return False, "Email credentials not configured. Please update EMAIL_CONFIG with your Gmail credentials."
+            
+            # Create reset instructions
+            reset_instructions = f"""
+Password Reset Request - Secure Folder Encryption
+
+Hello,
+
+You have requested to reset your password for the Secure Folder Encryption application.
+
+Please use the following reset token to reset your password:
+
+Reset Token: {reset_token}
+
+To reset your password:
+
+1. Open the Secure Folder Encryption application
+2. Click on "Forgot Password?" 
+3. Enter this reset token when prompted
+4. Create your new password
+
+This token will expire in 1 hour.
+
+If you did not request this reset, please ignore this email.
+
+Best regards,
+Secure Folder Encryption Team
+Supraja Technologies
+"""
+            
+            # Create message
+            msg = MIMEMultipart()
+            msg['From'] = EMAIL_CONFIG['sender_email']
+            msg['To'] = email
+            msg['Subject'] = "Password Reset Request - Secure Folder Encryption"
+            msg.attach(MIMEText(reset_instructions, 'plain'))
+            
+            # Send email
+            server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+            server.starttls()
+            server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
+            server.sendmail(EMAIL_CONFIG['sender_email'], email, msg.as_string())
+            server.quit()
+            
+            print(f"✅ Password reset email sent to {email}")
+            print(f"📧 Reset token: {reset_token}")
+            
+            return True, "Email sent successfully"
+            
+        except smtplib.SMTPAuthenticationError:
+            error_msg = "Email authentication failed. Please check your Gmail credentials and App Password."
+            print(f"❌ {error_msg}")
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Failed to send email: {str(e)}"
+            print(f"❌ {error_msg}")
+            return False, error_msg
+
+    def reset_password_with_token(self, token, new_password):
+        """Reset password using a valid token"""
+        # Verify token
+        is_valid, result = self.db.verify_reset_token(token)
+        if not is_valid:
+            return False, result
+        
+        email = result
+        
+        # Update password
+        success, message = self.db.update_password_by_email(email, new_password)
+        if success:
+            # Mark token as used
+            self.db.mark_token_used(token)
+            return True, "Password reset successfully"
+        else:
+            return False, message
+
+    def verify_token_and_reset(self, token, new_password, confirm_password):
+        """Verify token and reset password"""
+        if not token:
+            return False, "Reset token is required"
+        
+        if new_password != confirm_password:
+            return False, "Passwords do not match"
+        
+        if len(new_password) < 6:
+            return False, "Password must be at least 6 characters"
+        
+        return self.reset_password_with_token(token, new_password)
 
 # ==================== ASSET MANAGER ====================
 class AssetManager:
@@ -755,67 +1029,63 @@ class AuthGUI:
 
         # Title
         title_frame = tk.Frame(self.current_frame, bg=self.styles["bg"])
-        title_frame.pack(pady=(0, 20))
+        title_frame.pack(pady=(0, 30))
         
-        tk.Label(title_frame, text="👤", font=("Arial", 36), 
+        tk.Label(title_frame, text="👤", font=("Arial", 48), 
                 bg=self.styles["bg"], fg=self.styles["accent"]).pack()
         
         tk.Label(title_frame, text="Create Account", 
-                font=("Segoe UI", 24, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+                font=("Segoe UI", 28, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
 
-        # Registration Form - Use a canvas for scrollable content
-        container = tk.Frame(self.current_frame, bg=self.styles["bg"])
-        container.pack(fill=tk.BOTH, expand=True)
+        # Main container for centering
+        main_container = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        main_container.pack(expand=True, fill=tk.BOTH)
 
-        # Create a canvas and scrollbar
-        canvas = tk.Canvas(container, bg=self.styles["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg=self.styles["bg"])
+        # Center frame
+        center_frame = tk.Frame(main_container, bg=self.styles["bg"])
+        center_frame.place(relx=0.5, rely=0.5, anchor="center")
 
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # Registration Form
+        form_frame = tk.Frame(center_frame, bg=self.styles["panel_bg"], padx=40, pady=35,
+                            highlightthickness=2, highlightbackground=self.styles["accent"])
+        form_frame.pack(padx=20, pady=20)
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        # Form content
-        form_frame = tk.Frame(scrollable_frame, bg=self.styles["panel_bg"], padx=30, pady=25)
-        form_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        # Configure grid for better alignment
+        form_frame.columnconfigure(0, weight=1)
+        form_frame.columnconfigure(1, weight=1)
 
         # Username
-        tk.Label(form_frame, text="Username *", font=("Segoe UI", 11, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reg_username = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, bg="#3d3d3d", fg="white",
+        tk.Label(form_frame, text="Username *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.reg_username = tk.Entry(form_frame, font=("Segoe UI", 12), width=25, bg="#3d3d3d", fg="white",
                                 insertbackground="white", relief="flat")
-        self.reg_username.pack(fill=tk.X, pady=(0, 15))
+        self.reg_username.grid(row=0, column=1, sticky="ew", pady=(0, 15), padx=(15, 0))
 
         # Email
-        tk.Label(form_frame, text="Email *", font=("Segoe UI", 11, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reg_email = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, bg="#3d3d3d", fg="white",
+        tk.Label(form_frame, text="Email *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self.reg_email = tk.Entry(form_frame, font=("Segoe UI", 12), width=25, bg="#3d3d3d", fg="white",
                                 insertbackground="white", relief="flat")
-        self.reg_email.pack(fill=tk.X, pady=(0, 15))
+        self.reg_email.grid(row=1, column=1, sticky="ew", pady=(0, 15), padx=(15, 0))
 
         # Password
-        tk.Label(form_frame, text="Password *", font=("Segoe UI", 11, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reg_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, show="•", 
+        tk.Label(form_frame, text="Password *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.reg_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=25, show="•", 
                                 bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
-        self.reg_password.pack(fill=tk.X, pady=(0, 15))
+        self.reg_password.grid(row=2, column=1, sticky="ew", pady=(0, 15), padx=(15, 0))
 
         # Confirm Password
-        tk.Label(form_frame, text="Confirm Password *", font=("Segoe UI", 11, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reg_confirm_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, show="•", 
+        tk.Label(form_frame, text="Confirm Password *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.reg_confirm_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=25, show="•", 
                                         bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
-        self.reg_confirm_password.pack(fill=tk.X, pady=(0, 15))
+        self.reg_confirm_password.grid(row=3, column=1, sticky="ew", pady=(0, 15), padx=(15, 0))
 
         # Security Question
-        tk.Label(form_frame, text="Security Question *", font=("Segoe UI", 11, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.security_question = ttk.Combobox(form_frame, font=("Segoe UI", 12), width=33, state="readonly")
+        tk.Label(form_frame, text="Security Question *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).grid(row=4, column=0, sticky="w", pady=(0, 8))
+        self.security_question = ttk.Combobox(form_frame, font=("Segoe UI", 12), width=23, state="readonly")
         self.security_question['values'] = [
             "What was your first pet's name?",
             "What city were you born in?",
@@ -825,50 +1095,33 @@ class AuthGUI:
             "What was your childhood nickname?"
         ]
         self.security_question.current(0)
-        self.security_question.pack(fill=tk.X, pady=(0, 15))
+        self.security_question.grid(row=4, column=1, sticky="ew", pady=(0, 15), padx=(15, 0))
 
         # Security Answer
-        tk.Label(form_frame, text="Security Answer *", font=("Segoe UI", 11, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.security_answer = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, 
+        tk.Label(form_frame, text="Security Answer *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).grid(row=5, column=0, sticky="w", pady=(0, 8))
+        self.security_answer = tk.Entry(form_frame, font=("Segoe UI", 12), width=25, 
                                     bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
-        self.security_answer.pack(fill=tk.X, pady=(0, 25))
+        self.security_answer.grid(row=5, column=1, sticky="ew", pady=(0, 25), padx=(15, 0))
 
         # Button Frame
         button_frame = tk.Frame(form_frame, bg=self.styles["panel_bg"])
-        button_frame.pack(fill=tk.X, pady=(10, 15))
+        button_frame.grid(row=6, column=0, columnspan=2, pady=(10, 15), sticky="ew")
 
-        # Create Account Button - LARGER and more prominent
+        # Create Account Button - LARGER and centered
         register_btn = tk.Button(button_frame, text="CREATE ACCOUNT", font=("Segoe UI", 14, "bold"),
                             bg=self.styles["accent"], fg="white", relief="flat", cursor="hand2",
                             command=self.register, width=20, height=2)
         register_btn.pack(pady=(0, 15))
         self._add_hover_effect(register_btn, self.styles["accent"], "#558cc9")
 
-        # Back to Login Button - Clear and visible
+        # Back to Login Button - Centered
         back_btn = tk.Button(button_frame, text="← Back to Login", font=("Segoe UI", 12, "bold"), 
                             bg=self.styles["panel_bg"], fg=self.styles["accent"], 
                             relief="flat", cursor="hand2", padx=20, pady=8,
                             command=self.show_login_frame)
         back_btn.pack()
         self._add_hover_effect(back_btn, self.styles["panel_bg"], "#3d3d3d")
-
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Update scrollregion when the frame changes
-        def update_scrollregion(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        
-        scrollable_frame.bind("<Configure>", update_scrollregion)
-
-        # Mouse wheel scrolling
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        
-        canvas.bind("<MouseWheel>", on_mousewheel)
-        scrollable_frame.bind("<MouseWheel>", on_mousewheel)
 
         # Set focus to first field
         self.reg_username.focus_set()
@@ -913,109 +1166,290 @@ class AuthGUI:
 
         # Title
         title_frame = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        title_frame.pack(pady=(0, 30))
+        
+        tk.Label(title_frame, text="🔑", font=("Arial", 48), 
+                bg=self.styles["bg"], fg=self.styles["accent"]).pack()
+        
+        tk.Label(title_frame, text="Reset Password", 
+                font=("Segoe UI", 28, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+        
+        tk.Label(title_frame, text="Enter your registered email to receive password reset link", 
+                font=("Segoe UI", 12), bg=self.styles["bg"], fg=self.styles["text_muted"]).pack()
+
+        # Main container for centering
+        main_container = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        main_container.pack(expand=True, fill=tk.BOTH)
+
+        # Center frame
+        center_frame = tk.Frame(main_container, bg=self.styles["bg"])
+        center_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Reset Form
+        form_frame = tk.Frame(center_frame, bg=self.styles["panel_bg"], padx=40, pady=40,
+                            highlightthickness=2, highlightbackground=self.styles["accent"])
+        form_frame.pack(padx=20, pady=20)
+
+        # Email Entry
+        tk.Label(form_frame, text="Registered Email *", font=("Segoe UI", 12, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 10))
+        
+        self.reset_email = tk.Entry(form_frame, font=("Segoe UI", 12), width=30, bg="#3d3d3d", fg="white",
+                                insertbackground="white", relief="flat")
+        self.reset_email.pack(fill=tk.X, pady=(0, 30))
+        
+        # Info text
+        info_label = tk.Label(form_frame, 
+                            text="A password reset email with instructions will be sent to your email address.\nCheck your inbox and follow the instructions to reset your password.",
+                            font=("Segoe UI", 10), bg=self.styles["panel_bg"], fg=self.styles["text_muted"],
+                            wraplength=300, justify="center")
+        info_label.pack(pady=(0, 20))
+
+        # Send Reset Link Button
+        send_btn = tk.Button(form_frame, text="Send Reset Link", font=("Segoe UI", 12, "bold"),
+                            bg=self.styles["secondary"], fg="white", relief="flat", cursor="hand2",
+                            command=self.send_reset_link, width=20, height=2)
+        send_btn.pack(pady=(10, 20))
+        self._add_hover_effect(send_btn, self.styles["secondary"], "#45b7a8")
+
+        # Back to Login
+        back_btn = tk.Button(form_frame, text="← Back to Login", font=("Segoe UI", 11, "bold"), 
+                            bg=self.styles["panel_bg"], fg=self.styles["accent"], 
+                            relief="flat", cursor="hand2", padx=20, pady=6,
+                            command=self.show_login_frame)
+        back_btn.pack()
+        self._add_hover_effect(back_btn, self.styles["panel_bg"], "#3d3d3d")
+
+    def send_reset_link(self):
+        """Send password reset link to user's email"""
+        email = self.reset_email.get().strip()
+        
+        if not email:
+            messagebox.showerror("Error", "Please enter your email address")
+            return
+        
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            messagebox.showerror("Error", "Invalid email format")
+            return
+        
+        # Show loading state
+        self.progress_label = tk.Label(self.current_frame, text="Sending reset email...", 
+                                      font=("Segoe UI", 10), bg=self.styles["panel_bg"], fg=self.styles["accent"])
+        self.progress_label.pack(pady=10)
+        self.current_frame.update()
+        
+        try:
+            # Check if email exists and send reset link
+            success, message = self.auth_manager.initiate_password_reset(email)
+            
+            if success:
+                messagebox.showinfo("Reset Email Sent", 
+                                  f"Password reset instructions have been sent to:\n{email}\n\n"
+                                  f"Please check your email and follow the instructions to reset your password.")
+                
+                # Show token entry window
+                self.show_token_entry_window(email)
+            else:
+                messagebox.showerror("Error", message)
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to send reset email: {str(e)}")
+        finally:
+            if hasattr(self, 'progress_label'):
+                self.progress_label.destroy()
+
+    def show_token_entry_window(self, email):
+        """Show window to enter reset token and new password with scrollbar"""
+        token_win = tk.Toplevel(self.root)
+        token_win.title("Reset Password")
+        token_win.geometry("500x400")  # Fixed size
+        token_win.configure(bg=self.styles["bg"])
+        token_win.resizable(True, True)  # Allow resizing
+        
+        token_win.transient(self.root)
+        token_win.grab_set()
+        
+        # Create main container with scrollbar
+        main_container = tk.Frame(token_win, bg=self.styles["bg"])
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(main_container, bg=self.styles["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg=self.styles["bg"])
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Bind mousewheel to scroll
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Content frame inside scrollable frame
+        content_frame = tk.Frame(scrollable_frame, bg=self.styles["bg"], padx=20, pady=20)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
+        title_frame = tk.Frame(content_frame, bg=self.styles["bg"])
         title_frame.pack(pady=(0, 20))
         
         tk.Label(title_frame, text="🔑", font=("Arial", 36), 
                 bg=self.styles["bg"], fg=self.styles["accent"]).pack()
         
-        tk.Label(title_frame, text="Reset Password", 
-                font=("Segoe UI", 24, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+        tk.Label(title_frame, text="Reset Your Password", 
+                font=("Segoe UI", 20, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+        
+        tk.Label(title_frame, text=f"Check your email: {email}", 
+                font=("Segoe UI", 10), bg=self.styles["bg"], fg=self.styles["text_muted"]).pack()
 
-        # Reset Form
-        form_frame = tk.Frame(self.current_frame, bg=self.styles["panel_bg"], padx=30, pady=30)
-        form_frame.pack(fill=tk.BOTH, expand=True)
+        # Token Form
+        form_frame = tk.Frame(content_frame, bg=self.styles["panel_bg"], padx=30, pady=30)
+        form_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
-        # Username
-        tk.Label(form_frame, text="Username *", font=("Segoe UI", 10, "bold"),
+        # Token Entry
+        tk.Label(form_frame, text="Reset Token *", font=("Segoe UI", 11, "bold"),
                 bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reset_username = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, bg="#3d3d3d", fg="white",
-                                     insertbackground="white", relief="flat")
-        self.reset_username.pack(fill=tk.X, pady=(0, 10))
-        self.reset_username.bind('<KeyRelease>', self._update_security_question)
-
-        # Security Question
-        self.security_question_label = tk.Label(form_frame, text="Enter username to see security question", 
-                                               font=("Segoe UI", 9), bg=self.styles["panel_bg"], fg=self.styles["text_muted"])
-        self.security_question_label.pack(anchor="w", pady=(10, 5))
-
-        # Security Answer
-        tk.Label(form_frame, text="Security Answer *", font=("Segoe UI", 10, "bold"),
-                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reset_security_answer = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, 
-                                            bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
-        self.reset_security_answer.pack(fill=tk.X, pady=(0, 10))
+        token_entry = tk.Entry(form_frame, font=("Segoe UI", 12), width=30, 
+                            bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        token_entry.pack(fill=tk.X, pady=(0, 15))
 
         # New Password
-        tk.Label(form_frame, text="New Password *", font=("Segoe UI", 10, "bold"),
+        tk.Label(form_frame, text="New Password *", font=("Segoe UI", 11, "bold"),
                 bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reset_new_password = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, show="•", 
-                                         bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
-        self.reset_new_password.pack(fill=tk.X, pady=(0, 10))
+        new_password_entry = tk.Entry(form_frame, font=("Segoe UI", 12), width=30, show="•", 
+                                    bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        new_password_entry.pack(fill=tk.X, pady=(0, 15))
 
         # Confirm New Password
-        tk.Label(form_frame, text="Confirm New Password *", font=("Segoe UI", 10, "bold"),
+        tk.Label(form_frame, text="Confirm New Password *", font=("Segoe UI", 11, "bold"),
                 bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
-        self.reset_confirm_password = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, show="•", 
-                                             bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
-        self.reset_confirm_password.pack(fill=tk.X, pady=(0, 20))
+        confirm_password_entry = tk.Entry(form_frame, font=("Segoe UI", 12), width=30, show="•", 
+                                        bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        confirm_password_entry.pack(fill=tk.X, pady=(0, 15))
+
+        # Password strength indicator
+        self.token_strength_label = tk.Label(form_frame, text="Password strength: Not assessed", 
+                                            font=("Segoe UI", 9), bg=self.styles["panel_bg"], fg="#666666")
+        self.token_strength_label.pack(anchor="w", pady=(0, 10))
+
+        # Add real-time password strength assessment
+        def update_password_strength(event=None):
+            password = new_password_entry.get()
+            if password:
+                # Simple password strength check
+                score = 0
+                if len(password) >= 8:
+                    score += 1
+                if any(c.isupper() for c in password):
+                    score += 1
+                if any(c.islower() for c in password):
+                    score += 1
+                if any(c.isdigit() for c in password):
+                    score += 1
+                if any(not c.isalnum() for c in password):
+                    score += 1
+                
+                if score >= 5:
+                    message = "Strong password"
+                    color = "#2a9d8f"
+                elif score >= 3:
+                    message = "Medium strength"
+                    color = "#e9c46a"
+                else:
+                    message = "Weak password"
+                    color = "#e76f51"
+                
+                self.token_strength_label.config(text=f"Password strength: {message}", fg=color)
+            else:
+                self.token_strength_label.config(text="Password strength: Not assessed", fg="#666666")
+
+        new_password_entry.bind('<KeyRelease>', update_password_strength)
+
+        # Show password checkbox
+        show_pass_var = tk.BooleanVar()
+        show_pass_check = tk.Checkbutton(form_frame, text="Show passwords", variable=show_pass_var,
+                                        bg=self.styles["panel_bg"], fg=self.styles["fg"], 
+                                        font=("Segoe UI", 9),
+                                        command=lambda: self.toggle_passwords_visibility(
+                                            new_password_entry, confirm_password_entry, show_pass_var))
+        show_pass_check.pack(anchor="w", pady=(0, 20))
 
         # Reset Button
-        reset_btn = tk.Button(form_frame, text="Reset Password", font=("Segoe UI", 11, "bold"),
+        def perform_reset():
+            token = token_entry.get().strip()
+            new_pass = new_password_entry.get()
+            confirm_pass = confirm_password_entry.get()
+            
+            if not token:
+                messagebox.showerror("Error", "Please enter the reset token from your email")
+                return
+            
+            if not new_pass or not confirm_pass:
+                messagebox.showerror("Error", "Please enter both password fields")
+                return
+            
+            if new_pass != confirm_pass:
+                messagebox.showerror("Error", "Passwords do not match")
+                return
+            
+            if len(new_pass) < 6:
+                messagebox.showerror("Error", "Password must be at least 6 characters")
+                return
+            
+            # Reset password using token
+            success, message = self.auth_manager.verify_token_and_reset(token, new_pass, confirm_pass)
+            if success:
+                messagebox.showinfo("Success", "Password reset successfully! You can now login with your new password.")
+                token_win.destroy()
+                self.show_login_frame()
+            else:
+                messagebox.showerror("Error", message)
+
+        reset_btn = tk.Button(form_frame, text="Reset Password", font=("Segoe UI", 12, "bold"),
                             bg=self.styles["secondary"], fg="white", relief="flat", cursor="hand2",
-                            command=self.reset_password, width=20, height=2)
+                            command=perform_reset, width=20, height=2)
         reset_btn.pack(pady=(10, 15))
         self._add_hover_effect(reset_btn, self.styles["secondary"], "#45b7a8")
 
-        # Back to Login
-        tk.Button(form_frame, text="← Back to Login", font=("Segoe UI", 11, "bold"), bg=self.styles["panel_bg"],
-          fg=self.styles["accent"], relief="flat", cursor="hand2", pady=4,
-          command=self.show_login_frame).pack(pady=(10, 0))
+        # Back button
+        back_btn = tk.Button(form_frame, text="← Back", font=("Segoe UI", 10), 
+                            bg=self.styles["panel_bg"], fg=self.styles["accent"], 
+                            relief="flat", cursor="hand2",
+                            command=token_win.destroy)
+        back_btn.pack()
+        self._add_hover_effect(back_btn, self.styles["panel_bg"], "#3d3d3d")
 
-    def _update_security_question(self, event=None):
-        """Update security question when username changes"""
-        username = self.reset_username.get().strip()
-        if username:
-            question = self.auth_manager.get_security_question(username)
-            if question:
-                self.security_question_label.config(text=f"Security Question: {question}", 
-                                                  fg=self.styles["fg"])
-            else:
-                self.security_question_label.config(text="User not found", 
-                                                  fg=self.styles["error"])
-        else:
-            self.security_question_label.config(text="Enter username to see security question", 
-                                              fg=self.styles["text_muted"])
-
-    def reset_password(self):
-        """Handle password reset"""
-        username = self.reset_username.get().strip()
-        answer = self.reset_security_answer.get().strip()
-        new_pass = self.reset_new_password.get()
-        confirm_pass = self.reset_confirm_password.get()
-
-        if not all([username, answer, new_pass, confirm_pass]):
-            messagebox.showerror("Error", "All fields are required")
-            return
-
-        if new_pass != confirm_pass:
-            messagebox.showerror("Error", "New passwords do not match")
-            return
-
-        if len(new_pass) < 6:
-            messagebox.showerror("Error", "Password must be at least 6 characters")
-            return
-
-        success, message = self.auth_manager.reset_password(username, answer, new_pass, confirm_pass)
-        if success:
-            messagebox.showinfo("Success", message)
-            self.show_login_frame()
-        else:
-            messagebox.showerror("Password Reset Failed", message)
+        # Set focus to token entry
+        token_entry.focus_set()
+        
+        # Update the scrollregion after everything is drawn
+        token_win.update()
+        canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _add_hover_effect(self, widget, normal_bg, hover_bg):
         """Add hover effect to buttons"""
         widget.bind("<Enter>", lambda e: widget.config(bg=hover_bg))
         widget.bind("<Leave>", lambda e: widget.config(bg=normal_bg))
+
+    def toggle_passwords_visibility(self, password_entry, confirm_entry, show_var):
+        """Toggle password visibility for both password fields"""
+        if show_var.get():
+            password_entry.config(show="")
+            confirm_entry.config(show="")
+        else:
+            password_entry.config(show="•")
+            confirm_entry.config(show="•")
 
 # ==================== MAIN APPLICATION ====================
 class FolderEncryptorGUI:
@@ -2047,8 +2481,6 @@ Possible reasons:
             server.quit()
         except Exception as e:
             raise Exception(f"Failed to send email: {str(e)}")
-
-# ==================== APPLICATION STARTUP ====================
 
 # ==================== APPLICATION STARTUP ====================
 
