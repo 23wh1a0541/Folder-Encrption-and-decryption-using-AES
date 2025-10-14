@@ -18,6 +18,264 @@ import re
 from datetime import datetime
 import requests
 from io import BytesIO
+import sqlite3
+import uuid
+import sys
+
+# ==================== PATH MANAGEMENT ====================
+def get_base_path():
+    """Get the correct base path whether running as script or executable"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)   
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+BASE_PATH = get_base_path()
+
+# ==================== DATABASE MANAGER ====================
+class DatabaseManager:
+    def __init__(self):
+        self.db_path = os.path.join(BASE_PATH, "users.db")
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize the database and create users table"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT UNIQUE NOT NULL,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    security_question TEXT NOT NULL,
+                    security_answer_hash TEXT NOT NULL,
+                    registration_date TEXT NOT NULL,
+                    last_login TEXT,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    attempt_time TEXT NOT NULL,
+                    success INTEGER DEFAULT 0,
+                    ip_address TEXT
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            print("✅ Database initialized successfully")
+            
+        except Exception as e:
+            print(f"❌ Database initialization failed: {e}")
+    
+    def register_user(self, username, email, password, security_question, security_answer):
+        """Register a new user"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Check if username or email already exists
+            cursor.execute("SELECT * FROM users WHERE username = ? OR email = ?", (username, email))
+            if cursor.fetchone():
+                conn.close()
+                return False, "Username or email already exists"
+            
+            # Generate unique user ID
+            user_id = str(uuid.uuid4())[:8]
+            
+            # Hash password and security answer
+            password_hash = self._hash_password(password)
+            security_answer_hash = self._hash_password(security_answer.lower())
+            
+            # Insert new user
+            cursor.execute('''
+                INSERT INTO users (user_id, username, email, password_hash, security_question, security_answer_hash, registration_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, email, password_hash, security_question, security_answer_hash, datetime.now().isoformat()))
+            
+            conn.commit()
+            conn.close()
+            return True, "Registration successful! You can now login."
+            
+        except Exception as e:
+            return False, f"Registration failed: {str(e)}"
+    
+    def verify_user(self, username, password):
+        """Verify user login credentials"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (username,))
+            user = cursor.fetchone()
+            
+            if not user:
+                conn.close()
+                return False, "User not found or inactive"
+            
+            # Verify password
+            stored_hash = user[4]  # password_hash column
+            if self._verify_password(password, stored_hash):
+                # Update last login
+                cursor.execute("UPDATE users SET last_login = ? WHERE username = ?", 
+                             (datetime.now().isoformat(), username))
+                conn.commit()
+                conn.close()
+                return True, "Login successful"
+            else:
+                conn.close()
+                return False, "Invalid password"
+                
+        except Exception as e:
+            return False, f"Login failed: {str(e)}"
+    
+    def verify_security_answer(self, username, security_answer):
+        """Verify security answer for password reset"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT security_answer_hash FROM users WHERE username = ?", (username,))
+            result = cursor.fetchone()
+            
+            if not result:
+                conn.close()
+                return False, "User not found"
+            
+            stored_hash = result[0]
+            if self._verify_password(security_answer.lower(), stored_hash):
+                conn.close()
+                return True, "Security answer verified"
+            else:
+                conn.close()
+                return False, "Incorrect security answer"
+                
+        except Exception as e:
+            return False, f"Verification failed: {str(e)}"
+    
+    def update_password(self, username, new_password):
+        """Update user password"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            new_password_hash = self._hash_password(new_password)
+            cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", 
+                         (new_password_hash, username))
+            
+            conn.commit()
+            conn.close()
+            return True, "Password updated successfully"
+            
+        except Exception as e:
+            return False, f"Password update failed: {str(e)}"
+    
+    def get_security_question(self, username):
+        """Get security question for a user"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT security_question FROM users WHERE username = ?", (username,))
+            result = cursor.fetchone()
+            
+            conn.close()
+            return result[0] if result else None
+            
+        except Exception as e:
+            print(f"Error getting security question: {e}")
+            return None
+    
+    def _hash_password(self, password):
+        """Hash password using SHA-256 with salt"""
+        salt = "supraja_tech_2025"
+        return hashlib.sha256((password + salt).encode()).hexdigest()
+    
+    def _verify_password(self, password, stored_hash):
+        """Verify password against stored hash"""
+        return self._hash_password(password) == stored_hash
+
+# ==================== AUTHENTICATION MANAGER ====================
+class AuthManager:
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.current_user = None
+        self.login_callback = None
+    
+    def set_login_callback(self, callback):
+        """Set callback function to be called after successful login"""
+        self.login_callback = callback
+    
+    def register(self, username, email, password, confirm_password, security_question, security_answer):
+        """Handle user registration"""
+        # Validation
+        if not all([username, email, password, confirm_password, security_question, security_answer]):
+            return False, "All fields are required"
+        
+        if len(username) < 3:
+            return False, "Username must be at least 3 characters"
+        
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            return False, "Invalid email format"
+        
+        if password != confirm_password:
+            return False, "Passwords do not match"
+        
+        if len(password) < 6:
+            return False, "Password must be at least 6 characters"
+        
+        # Register user
+        return self.db.register_user(username, email, password, security_question, security_answer)
+    
+    def login(self, username, password):
+        """Handle user login"""
+        if not username or not password:
+            return False, "Username and password are required"
+        
+        return self.db.verify_user(username, password)
+    
+    def reset_password(self, username, security_answer, new_password, confirm_password):
+        """Handle password reset"""
+        if not all([username, security_answer, new_password, confirm_password]):
+            return False, "All fields are required"
+        
+        if new_password != confirm_password:
+            return False, "Passwords do not match"
+        
+        if len(new_password) < 6:
+            return False, "Password must be at least 6 characters"
+        
+        # Verify security answer
+        success, message = self.db.verify_security_answer(username, security_answer)
+        if not success:
+            return False, message
+        
+        # Update password
+        return self.db.update_password(username, new_password)
+    
+    def get_security_question(self, username):
+        """Get security question for password reset"""
+        return self.db.get_security_question(username)
+    
+    def set_current_user(self, username):
+        """Set current logged in user"""
+        self.current_user = username
+    
+    def get_current_user(self):
+        """Get current logged in user"""
+        return self.current_user
+    
+    def logout(self):
+        """Logout current user"""
+        self.current_user = None
 
 # ==================== ASSET MANAGER ====================
 class AssetManager:
@@ -27,19 +285,18 @@ class AssetManager:
     
     def _setup_assets_directory(self):
         """Create and return assets directory path"""
-        script_dir = Path(__file__).parent
-        assets_dir = script_dir / "assets"
-        assets_dir.mkdir(exist_ok=True)
+        assets_dir = os.path.join(BASE_PATH, "assets")
+        os.makedirs(assets_dir, exist_ok=True)
         return assets_dir
     
     def get_background_path(self):
         """Get background image path - PRIORITIZE USER'S IMAGE"""
         # First, check for custom background in assets folder
-        custom_bg_path = self.assets_dir / "custom_background.png"
-        if custom_bg_path.exists():
+        custom_bg_path = os.path.join(self.assets_dir, "custom_background.png")
+        if os.path.exists(custom_bg_path):
             print(f"✅ Found custom background: {custom_bg_path}")
-            self.current_background_path = str(custom_bg_path)
-            return str(custom_bg_path)
+            self.current_background_path = custom_bg_path
+            return custom_bg_path
         
         # Check for other common image files in assets folder
         possible_names = [
@@ -52,27 +309,20 @@ class AssetManager:
         # Check all combinations in assets folder
         for name in possible_names:
             for ext in possible_extensions:
-                potential_path = self.assets_dir / f"{name}{ext}"
-                if potential_path.exists():
+                potential_path = os.path.join(self.assets_dir, f"{name}{ext}")
+                if os.path.exists(potential_path):
                     print(f"✅ Found background: {potential_path}")
-                    self.current_background_path = str(potential_path)
-                    return str(potential_path)
+                    self.current_background_path = potential_path
+                    return potential_path
         
-        # Check in script directory
+        # Check in base directory
         for name in possible_names:
             for ext in possible_extensions:
-                potential_path = Path(__file__).parent / f"{name}{ext}"
-                if potential_path.exists():
+                potential_path = os.path.join(BASE_PATH, f"{name}{ext}")
+                if os.path.exists(potential_path):
                     print(f"✅ Found background: {potential_path}")
-                    self.current_background_path = str(potential_path)
-                    return str(potential_path)
-        
-        # Specific path for your original background
-        original_path = r"C:\Users\tasle\project\siri1.jpg"
-        if os.path.exists(original_path):
-            print(f"✅ Using original background: {original_path}")
-            self.current_background_path = original_path
-            return original_path
+                    self.current_background_path = potential_path
+                    return potential_path
         
         # If no image found, create default
         print("⚠️ No background image found. Creating default...")
@@ -92,15 +342,15 @@ class AssetManager:
             draw.line([(0, i), (1920, i)], fill=(r, g, b))
         
         # Save to assets folder
-        default_bg_path = self.assets_dir / "default_background.png"
+        default_bg_path = os.path.join(self.assets_dir, "default_background.png")
         img.save(default_bg_path)
-        return str(default_bg_path)
+        return default_bg_path
     
     def set_custom_background(self, image_path):
         """Set a custom background image"""
         try:
             # Copy to assets folder as custom_background.png
-            destination = self.assets_dir / "custom_background.png"
+            destination = os.path.join(self.assets_dir, "custom_background.png")
             
             # Convert and save as PNG for consistency
             img = Image.open(image_path).convert("RGBA")
@@ -110,7 +360,7 @@ class AssetManager:
             img = img.resize((screen_width, screen_height), Image.LANCZOS)
             
             img.save(destination)
-            self.current_background_path = str(destination)
+            self.current_background_path = destination
             print(f"✅ Custom background saved to: {destination}")
             return True
         except Exception as e:
@@ -122,13 +372,12 @@ class AssetManager:
         try:
             # Multiple possible logo URLs for Supraja Technologies
             logo_urls = [
-                "https://www.suprajatechnologies.com/images/logo.png",
-                "https://www.suprajatechnologies.com/static/images/logo.png",
-                "https://suprajatechnologies.com/wp-content/uploads/2023/05/logo.png",
-                "https://via.placeholder.com/120x120/3a6ea5/ffffff?text=ST"  # Fallback
+                "https://via.placeholder.com/120x120/3a6ea5/ffffff?text=ST",
+                "https://via.placeholder.com/120x120/2a9d8f/ffffff?text=ST",
+                "https://via.placeholder.com/120x120/1e1e1e/ffffff?text=ST"
             ]
             
-            logo_path = self.assets_dir / "supraja_logo.png"
+            logo_path = os.path.join(self.assets_dir, "supraja_logo.png")
             
             for url in logo_urls:
                 try:
@@ -139,15 +388,14 @@ class AssetManager:
                         with open(logo_path, 'wb') as f:
                             f.write(response.content)
                         print(f"✅ Logo downloaded successfully: {logo_path}")
-                        return str(logo_path)
+                        return logo_path
                 except Exception as e:
                     print(f"❌ Failed to download from {url}: {e}")
                     continue
             
             # Create a simple logo if download fails
             print("⚠️ Creating default logo...")
-            self._create_default_logo()
-            return str(logo_path)
+            return self._create_default_logo()
             
         except Exception as e:
             print(f"❌ Logo download failed: {e}")
@@ -156,7 +404,7 @@ class AssetManager:
     def _create_default_logo(self):
         """Create a default Supraja Technologies logo"""
         try:
-            logo_path = self.assets_dir / "supraja_logo.png"
+            logo_path = os.path.join(self.assets_dir, "supraja_logo.png")
             
             # Create a professional-looking logo
             img = Image.new('RGBA', (120, 120), color=(0, 0, 0, 0))
@@ -165,17 +413,13 @@ class AssetManager:
             # Draw circular background
             draw.ellipse([0, 0, 120, 120], fill='#3a6ea5')
             
-            # Draw 'ST' text
-            # You'd need a more complex approach for text drawing
-            # For now, we'll create a simple geometric design
+            # Draw 'ST' text using rectangles (simplified)
             draw.rectangle([30, 40, 50, 80], fill='white')  # S part 1
             draw.rectangle([60, 40, 80, 80], fill='white')  # T part 1
-            draw.rectangle([35, 45, 45, 50], fill='#3a6ea5')  # S curve
-            draw.rectangle([35, 65, 45, 70], fill='#3a6ea5')  # S curve
             
             img.save(logo_path)
             print(f"✅ Default logo created: {logo_path}")
-            return str(logo_path)
+            return logo_path
         except Exception as e:
             print(f"❌ Failed to create default logo: {e}")
             return None
@@ -188,10 +432,10 @@ class EncryptionLogger:
         
     def setup_logging(self):
         """Setup comprehensive logging configuration"""
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True)
+        log_dir = os.path.join(BASE_PATH, "logs")
+        os.makedirs(log_dir, exist_ok=True)
         
-        log_filename = log_dir / f"{self.app_name}_{datetime.now().strftime('%Y%m%d')}.log"
+        log_filename = os.path.join(log_dir, f"{self.app_name}_{datetime.now().strftime('%Y%m%d')}.log")
         
         logging.basicConfig(
             level=logging.INFO,
@@ -376,10 +620,418 @@ class ThemeManager:
         self.current_theme = "light" if self.current_theme == "dark" else "dark"
         return self.get_theme()
 
+# ==================== AUTHENTICATION GUI ====================
+class AuthGUI:
+    def __init__(self, root, auth_manager):
+        self.root = root
+        self.auth_manager = auth_manager
+        self.current_frame = None
+        
+        # Setup window
+        self.root.title("Secure Folder Encryption - Authentication")
+        self.root.geometry("1000x800")
+        self.root.configure(bg='#1e1e1e')
+        self.root.resizable(False, False)
+        
+        self._setup_styles()
+        self.show_login_frame()
+        self.center_window()
+
+    def center_window(self):
+        """Center the window on screen"""
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+
+    def _setup_styles(self):
+        self.styles = {
+            "bg": "#1e1e1e",
+            "fg": "#ffffff",
+            "accent": "#3a6ea5",
+            "secondary": "#2a9d8f",
+            "panel_bg": "#2d2d2d",
+            "text_muted": "#cccccc",
+            "error": "#e74c3c",
+            "success": "#2ecc71"
+        }
+
+    def clear_frame(self):
+        if self.current_frame:
+            self.current_frame.destroy()
+
+    # ---------------- LOGIN ----------------
+    def show_login_frame(self):
+        self.clear_frame()
+        self.current_frame = tk.Frame(self.root, bg=self.styles["bg"], padx=40, pady=40)
+        self.current_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Logo/Title
+        title_frame = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        title_frame.pack(pady=(0, 30))
+        
+        tk.Label(title_frame, text="🔒", font=("Arial", 48), 
+                bg=self.styles["bg"], fg=self.styles["accent"]).pack()
+        
+        tk.Label(title_frame, text="Secure Folder Encryption", 
+                font=("Segoe UI", 24, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+        
+        tk.Label(title_frame, text="Please login to continue", 
+                font=("Segoe UI", 12), bg=self.styles["bg"], fg=self.styles["text_muted"]).pack()
+
+        # Login Form
+        form_frame = tk.Frame(self.current_frame, bg=self.styles["panel_bg"], padx=30, pady=30)
+        form_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Username
+        tk.Label(form_frame, text="Username", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        
+        self.login_username = tk.Entry(form_frame, font=("Segoe UI", 12), width=30, bg="#3d3d3d", fg="white",
+                                    insertbackground="white", relief="flat")
+        self.login_username.pack(fill=tk.X, pady=(0, 15))
+        self.login_username.bind('<Return>', lambda e: self.login())
+
+        # Password
+        tk.Label(form_frame, text="Password", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        
+        self.login_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=30, show="•", 
+                                    bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.login_password.pack(fill=tk.X, pady=(0, 20))
+        self.login_password.bind('<Return>', lambda e: self.login())
+
+        # Login Button
+        login_btn = tk.Button(form_frame, text="Login", font=("Segoe UI", 12, "bold"),
+                            bg=self.styles["accent"], fg="white", relief="flat", cursor="hand2",
+                            command=self.login, width=20, height=2)
+        login_btn.pack(pady=(10, 15))
+        self._add_hover_effect(login_btn, self.styles["accent"], "#558cc9")
+
+        # Links
+        links_frame = tk.Frame(form_frame, bg=self.styles["panel_bg"])
+        links_frame.pack()
+        
+        tk.Button(links_frame, text="Register", font=("Segoe UI", 10), bg=self.styles["panel_bg"],
+                fg=self.styles["accent"], relief="flat", cursor="hand2",
+                command=self.show_register_frame).pack(side=tk.LEFT, padx=(0, 20))
+        
+        tk.Button(links_frame, text="Forgot Password?", font=("Segoe UI", 10), bg=self.styles["panel_bg"],
+                fg=self.styles["accent"], relief="flat", cursor="hand2",
+                command=self.show_forgot_password_frame).pack(side=tk.LEFT)
+
+    def login(self):
+        """Handle user login"""
+        username = self.login_username.get().strip()
+        password = self.login_password.get()
+
+        if not username or not password:
+            messagebox.showerror("Error", "Please enter both username and password")
+            return
+
+        success, message = self.auth_manager.login(username, password)
+        if success:
+            self.auth_manager.set_current_user(username)
+            messagebox.showinfo("Success", f"Welcome {username}!")
+            print(f"✅ User {username} logged in successfully")
+            
+            # Close auth window and trigger callback
+            self.root.destroy()
+            if self.auth_manager.login_callback:
+                print("🚀 Launching main application...")
+                self.auth_manager.login_callback()
+            else:
+                print("❌ No login callback set!")
+        else:
+            messagebox.showerror("Login Failed", message)
+
+    # ---------------- REGISTER ----------------
+    def show_register_frame(self):
+        self.clear_frame()
+        self.current_frame = tk.Frame(self.root, bg=self.styles["bg"], padx=40, pady=30)
+        self.current_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
+        title_frame = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        title_frame.pack(pady=(0, 20))
+        
+        tk.Label(title_frame, text="👤", font=("Arial", 36), 
+                bg=self.styles["bg"], fg=self.styles["accent"]).pack()
+        
+        tk.Label(title_frame, text="Create Account", 
+                font=("Segoe UI", 24, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+
+        # Registration Form - Use a canvas for scrollable content
+        container = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # Create a canvas and scrollbar
+        canvas = tk.Canvas(container, bg=self.styles["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg=self.styles["bg"])
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Form content
+        form_frame = tk.Frame(scrollable_frame, bg=self.styles["panel_bg"], padx=30, pady=25)
+        form_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # Username
+        tk.Label(form_frame, text="Username *", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reg_username = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, bg="#3d3d3d", fg="white",
+                                insertbackground="white", relief="flat")
+        self.reg_username.pack(fill=tk.X, pady=(0, 15))
+
+        # Email
+        tk.Label(form_frame, text="Email *", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reg_email = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, bg="#3d3d3d", fg="white",
+                                insertbackground="white", relief="flat")
+        self.reg_email.pack(fill=tk.X, pady=(0, 15))
+
+        # Password
+        tk.Label(form_frame, text="Password *", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reg_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, show="•", 
+                                bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.reg_password.pack(fill=tk.X, pady=(0, 15))
+
+        # Confirm Password
+        tk.Label(form_frame, text="Confirm Password *", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reg_confirm_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, show="•", 
+                                        bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.reg_confirm_password.pack(fill=tk.X, pady=(0, 15))
+
+        # Security Question
+        tk.Label(form_frame, text="Security Question *", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.security_question = ttk.Combobox(form_frame, font=("Segoe UI", 12), width=33, state="readonly")
+        self.security_question['values'] = [
+            "What was your first pet's name?",
+            "What city were you born in?",
+            "What is your mother's maiden name?",
+            "What was your first school name?",
+            "What is your favorite book?",
+            "What was your childhood nickname?"
+        ]
+        self.security_question.current(0)
+        self.security_question.pack(fill=tk.X, pady=(0, 15))
+
+        # Security Answer
+        tk.Label(form_frame, text="Security Answer *", font=("Segoe UI", 11, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.security_answer = tk.Entry(form_frame, font=("Segoe UI", 12), width=35, 
+                                    bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.security_answer.pack(fill=tk.X, pady=(0, 25))
+
+        # Button Frame
+        button_frame = tk.Frame(form_frame, bg=self.styles["panel_bg"])
+        button_frame.pack(fill=tk.X, pady=(10, 15))
+
+        # Create Account Button - LARGER and more prominent
+        register_btn = tk.Button(button_frame, text="CREATE ACCOUNT", font=("Segoe UI", 14, "bold"),
+                            bg=self.styles["accent"], fg="white", relief="flat", cursor="hand2",
+                            command=self.register, width=20, height=2)
+        register_btn.pack(pady=(0, 15))
+        self._add_hover_effect(register_btn, self.styles["accent"], "#558cc9")
+
+        # Back to Login Button - Clear and visible
+        back_btn = tk.Button(button_frame, text="← Back to Login", font=("Segoe UI", 12, "bold"), 
+                            bg=self.styles["panel_bg"], fg=self.styles["accent"], 
+                            relief="flat", cursor="hand2", padx=20, pady=8,
+                            command=self.show_login_frame)
+        back_btn.pack()
+        self._add_hover_effect(back_btn, self.styles["panel_bg"], "#3d3d3d")
+
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Update scrollregion when the frame changes
+        def update_scrollregion(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        scrollable_frame.bind("<Configure>", update_scrollregion)
+
+        # Mouse wheel scrolling
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        scrollable_frame.bind("<MouseWheel>", on_mousewheel)
+
+        # Set focus to first field
+        self.reg_username.focus_set()
+
+    def register(self):
+        """Handle user registration"""
+        username = self.reg_username.get().strip()
+        email = self.reg_email.get().strip()
+        password = self.reg_password.get()
+        confirm_password = self.reg_confirm_password.get()
+        security_question = self.security_question.get()
+        security_answer = self.security_answer.get().strip()
+
+        if not all([username, email, password, confirm_password, security_question, security_answer]):
+            messagebox.showerror("Error", "All fields are required")
+            return
+
+        if password != confirm_password:
+            messagebox.showerror("Error", "Passwords do not match")
+            return
+
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            messagebox.showerror("Error", "Invalid email format")
+            return
+
+        if len(password) < 6:
+            messagebox.showerror("Error", "Password must be at least 6 characters")
+            return
+
+        success, message = self.auth_manager.register(username, email, password, confirm_password, security_question, security_answer)
+        if success:
+            messagebox.showinfo("Success", message)
+            self.show_login_frame()
+        else:
+            messagebox.showerror("Registration Failed", message)
+
+    # ---------------- FORGOT PASSWORD ----------------
+    def show_forgot_password_frame(self):
+        self.clear_frame()
+        self.current_frame = tk.Frame(self.root, bg=self.styles["bg"], padx=40, pady=40)
+        self.current_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
+        title_frame = tk.Frame(self.current_frame, bg=self.styles["bg"])
+        title_frame.pack(pady=(0, 20))
+        
+        tk.Label(title_frame, text="🔑", font=("Arial", 36), 
+                bg=self.styles["bg"], fg=self.styles["accent"]).pack()
+        
+        tk.Label(title_frame, text="Reset Password", 
+                font=("Segoe UI", 24, "bold"), bg=self.styles["bg"], fg=self.styles["fg"]).pack(pady=(10, 5))
+
+        # Reset Form
+        form_frame = tk.Frame(self.current_frame, bg=self.styles["panel_bg"], padx=30, pady=30)
+        form_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Username
+        tk.Label(form_frame, text="Username *", font=("Segoe UI", 10, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reset_username = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, bg="#3d3d3d", fg="white",
+                                     insertbackground="white", relief="flat")
+        self.reset_username.pack(fill=tk.X, pady=(0, 10))
+        self.reset_username.bind('<KeyRelease>', self._update_security_question)
+
+        # Security Question
+        self.security_question_label = tk.Label(form_frame, text="Enter username to see security question", 
+                                               font=("Segoe UI", 9), bg=self.styles["panel_bg"], fg=self.styles["text_muted"])
+        self.security_question_label.pack(anchor="w", pady=(10, 5))
+
+        # Security Answer
+        tk.Label(form_frame, text="Security Answer *", font=("Segoe UI", 10, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reset_security_answer = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, 
+                                            bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.reset_security_answer.pack(fill=tk.X, pady=(0, 10))
+
+        # New Password
+        tk.Label(form_frame, text="New Password *", font=("Segoe UI", 10, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reset_new_password = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, show="•", 
+                                         bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.reset_new_password.pack(fill=tk.X, pady=(0, 10))
+
+        # Confirm New Password
+        tk.Label(form_frame, text="Confirm New Password *", font=("Segoe UI", 10, "bold"),
+                bg=self.styles["panel_bg"], fg=self.styles["fg"]).pack(anchor="w", pady=(0, 5))
+        self.reset_confirm_password = tk.Entry(form_frame, font=("Segoe UI", 11), width=30, show="•", 
+                                             bg="#3d3d3d", fg="white", insertbackground="white", relief="flat")
+        self.reset_confirm_password.pack(fill=tk.X, pady=(0, 20))
+
+        # Reset Button
+        reset_btn = tk.Button(form_frame, text="Reset Password", font=("Segoe UI", 11, "bold"),
+                            bg=self.styles["secondary"], fg="white", relief="flat", cursor="hand2",
+                            command=self.reset_password, width=20, height=2)
+        reset_btn.pack(pady=(10, 15))
+        self._add_hover_effect(reset_btn, self.styles["secondary"], "#45b7a8")
+
+        # Back to Login
+        tk.Button(form_frame, text="← Back to Login", font=("Segoe UI", 11, "bold"), bg=self.styles["panel_bg"],
+          fg=self.styles["accent"], relief="flat", cursor="hand2", pady=4,
+          command=self.show_login_frame).pack(pady=(10, 0))
+
+    def _update_security_question(self, event=None):
+        """Update security question when username changes"""
+        username = self.reset_username.get().strip()
+        if username:
+            question = self.auth_manager.get_security_question(username)
+            if question:
+                self.security_question_label.config(text=f"Security Question: {question}", 
+                                                  fg=self.styles["fg"])
+            else:
+                self.security_question_label.config(text="User not found", 
+                                                  fg=self.styles["error"])
+        else:
+            self.security_question_label.config(text="Enter username to see security question", 
+                                              fg=self.styles["text_muted"])
+
+    def reset_password(self):
+        """Handle password reset"""
+        username = self.reset_username.get().strip()
+        answer = self.reset_security_answer.get().strip()
+        new_pass = self.reset_new_password.get()
+        confirm_pass = self.reset_confirm_password.get()
+
+        if not all([username, answer, new_pass, confirm_pass]):
+            messagebox.showerror("Error", "All fields are required")
+            return
+
+        if new_pass != confirm_pass:
+            messagebox.showerror("Error", "New passwords do not match")
+            return
+
+        if len(new_pass) < 6:
+            messagebox.showerror("Error", "Password must be at least 6 characters")
+            return
+
+        success, message = self.auth_manager.reset_password(username, answer, new_pass, confirm_pass)
+        if success:
+            messagebox.showinfo("Success", message)
+            self.show_login_frame()
+        else:
+            messagebox.showerror("Password Reset Failed", message)
+
+    def _add_hover_effect(self, widget, normal_bg, hover_bg):
+        """Add hover effect to buttons"""
+        widget.bind("<Enter>", lambda e: widget.config(bg=hover_bg))
+        widget.bind("<Leave>", lambda e: widget.config(bg=normal_bg))
+
 # ==================== MAIN APPLICATION ====================
 class FolderEncryptorGUI:
-    def __init__(self, root):
+    def __init__(self, root, auth_manager):
         self.root = root
+        self.auth_manager = auth_manager
+        
+        # Check authentication
+        current_user = self.auth_manager.get_current_user()
+        print(f"🔍 User authenticated: {current_user}")
+        
+        if not current_user:
+            messagebox.showerror("Error", "Not authenticated properly!")
+            self.root.destroy()
+            return
+        
         self.root.title("Secure Folder Encryption & Decryption")
         self.root.state("zoomed")
         
@@ -400,6 +1052,9 @@ class FolderEncryptorGUI:
     def _set_background(self):
         """Set the background image with proper error handling"""
         try:
+            # First set a solid background
+            self.root.configure(bg="#1e1e1e")
+            
             background_path = self.asset_manager.get_background_path()
             print(f"🖼️ Loading background from: {background_path}")
             
@@ -410,23 +1065,19 @@ class FolderEncryptorGUI:
                 img = img.resize((win_w, win_h), Image.LANCZOS)
                 self.bg_photo = ImageTk.PhotoImage(img)
                 
-                # Create or update background label
-                if not self.bg_label:
-                    self.bg_label = tk.Label(self.root, image=self.bg_photo)
-                    self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
-                    # Make sure background is at the bottom layer
-                    self.bg_label.lower()
-                else:
-                    self.bg_label.configure(image=self.bg_photo)
+                # Create background label
+                self.bg_label = tk.Label(self.root, image=self.bg_photo)
+                self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+                self.bg_label.lower()  # Send to back
                 
                 print("✅ Background loaded successfully")
             else:
-                self._set_fallback_background()
+                print("⚠️ Background image not found, using solid color")
                 
         except Exception as e:
             print(f"❌ Failed to load background: {e}")
-            self._set_fallback_background()
-    
+            # Keep the solid background
+            self.root.configure(bg="#1e1e1e")
     def _set_fallback_background(self):
         """Set a fallback background if image loading fails"""
         try:
@@ -480,6 +1131,21 @@ class FolderEncryptorGUI:
 
     # ------------------- INTERFACE ------------------- #
     def _build_interface(self):
+        # User info and logout button
+        user_frame = tk.Frame(self.root, bg="#1e1e1e", padx=10, pady=5)
+        user_frame.place(relx=0.02, rely=0.02, anchor="nw")
+        
+        current_user = self.auth_manager.get_current_user()
+        user_label = tk.Label(user_frame, text=f"👤 {current_user}", font=("Segoe UI", 10, "bold"),
+                             bg="#1e1e1e", fg="#ffffff")
+        user_label.pack(side=tk.LEFT)
+        
+        logout_btn = tk.Button(user_frame, text="Logout", font=("Segoe UI", 9),
+                              bg="#e74c3c", fg="white", relief="flat", cursor="hand2",
+                              command=self.logout)
+        logout_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self._add_hover(logout_btn, normal_bg="#e74c3c", hover_bg="#c0392b")
+
         # Theme Toggle Button
         theme_btn = tk.Button(
             self.root,
@@ -503,7 +1169,7 @@ class FolderEncryptorGUI:
         self._add_hover(bg_btn, normal_bg="#6a3ea5", hover_bg="#8a5ec5")
 
         # Project Info button
-        top_frame = tk.Frame(self.root, bg="", padx=0, pady=8)
+        top_frame = tk.Frame(self.root, bg="#1e1e1e", padx=0, pady=8)
         top_frame.place(relx=0.5, rely=0.04, anchor="n")
         project_btn = tk.Button(
             top_frame,
@@ -560,6 +1226,14 @@ class FolderEncryptorGUI:
                         font=("Segoe UI", 8), fg=theme["text_muted"], bg=panel_bg)
         foot.pack(side="bottom", pady=(8,2))
 
+    def logout(self):
+        """Logout user and return to authentication"""
+        if messagebox.askyesno("Logout", "Are you sure you want to logout?"):
+            self.auth_manager.logout()
+            self.root.destroy()
+            # Restart the application with authentication
+            start_authentication()
+
     def toggle_theme(self):
         new_theme = self.theme_manager.toggle_theme()
         self._rebuild_interface_with_theme(new_theme)
@@ -573,14 +1247,19 @@ class FolderEncryptorGUI:
 
     # ------------------- ICON ------------------- #
     def _load_icon(self, parent):
-        script_dir = os.path.dirname(__file__)
+        # Look for icon in base directory
         for ext in ("png", "jpg", "jpeg", "ico"):
-            icon_path = os.path.join(script_dir, f"image.{ext}")
+            icon_path = os.path.join(BASE_PATH, f"image.{ext}")
             if os.path.exists(icon_path):
-                img = Image.open(icon_path).convert("RGBA").resize((90,90), Image.LANCZOS)
-                self.folder_icon = ImageTk.PhotoImage(img)
-                tk.Label(parent, image=self.folder_icon, bg=parent["bg"], bd=0).pack(pady=5)
-                return
+                try:
+                    img = Image.open(icon_path).convert("RGBA").resize((90,90), Image.LANCZOS)
+                    self.folder_icon = ImageTk.PhotoImage(img)
+                    tk.Label(parent, image=self.folder_icon, bg=parent["bg"], bd=0).pack(pady=5)
+                    return
+                except Exception as e:
+                    print(f"Error loading icon: {e}")
+        
+        # Fallback to emoji
         tk.Label(parent, text="🔒", font=("Segoe UI",48), fg="#3a6ea5", bg=parent["bg"]).pack(pady=5)
 
     # ------------------- HOVER ------------------- #
@@ -622,10 +1301,10 @@ class FolderEncryptorGUI:
                 
             except Exception as e:
                 print(f"Logo processing error: {e}")
-                logo_src = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgdmlld0JveD0iMCAwIDEyMCAxMjAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiByeD0iNjAiIGZpbGw9IiMzYTZlYTUiLz4KPHRleHQgeD0iNjAiIHk9IjY4IiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMjQiIGZpbGw9IndoaXRlIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXdlaWdodD0iYm9sZCI+U1Q8L3RleHQ+Cjwvc3ZnPgo="
+                logo_src = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgdmlld0JveD0iMCAwIDEyMCAxMjAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiByeD0iNjAiIGZpbGw9IiMzYTZlYTUiLz4KPHRleHQgeD0iNjAiIHk9IjY4IiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMjQiIGZpbGw9IndoaXRlIiB0ZXh0LWFuY2hvcj9taWRkbGUiIGZvbnQtd2VpZ2h0PSJib2xkIj5TVDwvdGV4dD4KPC9zdmc+Cg=="
         else:
             # Use fallback base64 encoded logo
-            logo_src = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgdmlld0JveD0iMCAwIDEyMCAxMjAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiByeD0iNjAiIGZpbGw9IiMzYTZlYTUiLz4KPHRleHQgeD0iNjAiIHk9IjY4IiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMjQiIGZpbGw9IndoaXRlIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXdlaWdodD0iYm9sZCI+U1Q8L3RleHQ+Cjwvc3ZnPgo="
+            logo_src = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgdmlld0JveD0iMCAwIDEyMCAxMjAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiByeD0iNjAiIGZpbGw9IiMzYTZlYTUiLz4KPHRleHQgeD0iNjAiIHk9IjY4IiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMjQiIGZpbGw9IndoaXRlIiB0ZXh0LWFuY2hvcj9taWRkbGUiIGZvbnQtd2VpZ2h0PSJib2xkIj5TVDwvdGV4dD4KPC9zdmc+Cg=="
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1369,8 +2048,38 @@ Possible reasons:
         except Exception as e:
             raise Exception(f"Failed to send email: {str(e)}")
 
+# ==================== APPLICATION STARTUP ====================
+
+# ==================== APPLICATION STARTUP ====================
+
+# Global auth manager
+auth_manager = AuthManager()
+
+def start_application():
+    """Start the main application"""
+    print("🚀 Starting Main Application...")
+    root = tk.Tk()
+    app = FolderEncryptorGUI(root, auth_manager)
+    root.mainloop()
+
+def start_authentication():
+    """Start the authentication system"""
+    print("🔐 Starting Authentication...")
+    auth_root = tk.Tk()
+    auth_gui = AuthGUI(auth_root, auth_manager)
+    auth_root.mainloop()
+
+# Set login callback
+def on_login_success():
+    """Callback function when login is successful"""
+    print("✅ Login successful! Launching main application...")
+    start_application()
+
+auth_manager.set_login_callback(on_login_success)
+
 # ------------------- RUN APP ------------------- #
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = FolderEncryptorGUI(root)
-    root.mainloop()
+    # Start with authentication
+    print(f"🚀 Starting Secure Folder Encryption Application...")
+    print(f"📁 Base Path: {BASE_PATH}")
+    start_authentication()
