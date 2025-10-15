@@ -22,7 +22,6 @@ import sqlite3
 import uuid
 import sys
 
-
 # ==================== EMAIL CONFIGURATION ====================
 EMAIL_CONFIG = {
     'smtp_server': 'smtp.gmail.com',
@@ -1600,7 +1599,7 @@ class FolderEncryptorGUI:
             bg="#6a3ea5", fg="white",
             command=self.select_custom_background
         )
-        bg_btn.place(relx=0.95, rely=0.07, anchor="ne")
+        bg_btn.place(relx=0.95, rely=0.08, anchor="ne")
         self._add_hover(bg_btn, normal_bg="#6a3ea5", hover_bg="#8a5ec5")
 
         # Project Info button
@@ -1627,7 +1626,7 @@ class FolderEncryptorGUI:
             highlightthickness=2, highlightbackground=panel_border,
             padx=16, pady=12
         )
-        container.place(relx=0.75, rely=0.2, relwidth=0.35, relheight=0.6, anchor="n")
+        container.place(relx=0.50, rely=0.2, relwidth=0.35, relheight=0.6, anchor="n")
 
         title = tk.Label(container, text="Secure Folder Encryption", font=("Segoe UI", 16, "bold"),
                          fg=theme["fg"], bg=panel_bg)
@@ -1705,7 +1704,7 @@ class FolderEncryptorGUI:
     # ------------------- PROJECT INFO ------------------- #
     def open_about(self):
         # Download or get Supraja Technologies logo
-        logo_path = self.asset_manager.download_supraja_logo()
+        logo_path = os.path.join(BASE_PATH, "assets", "logo.jpeg")
         circular_logo_path = None
         
         # Create circular version of the logo
@@ -2516,4 +2515,3 @@ if __name__ == "__main__":
     print(f"🚀 Starting Secure Folder Encryption Application...")
     print(f"📁 Base Path: {BASE_PATH}")
     start_authentication()
-
