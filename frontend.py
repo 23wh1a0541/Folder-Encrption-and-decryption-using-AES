@@ -24,7 +24,6 @@ import sys
 
 
 
-
 # ==================== EMAIL CONFIGURATION ====================
 EMAIL_CONFIG = {
     'smtp_server': 'smtp.gmail.com',
@@ -2518,6 +2517,7 @@ if __name__ == "__main__":
     print(f"🚀 Starting Secure Folder Encryption Application...")
     print(f"📁 Base Path: {BASE_PATH}")
     start_authentication()
+
 
 
 
