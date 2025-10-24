@@ -15,14 +15,17 @@ import logging
 import json
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta  # ← ADD timedelta HERE
 import requests
 from io import BytesIO
 import sqlite3
 import uuid
 import sys
-
-
+import cv2
+import numpy as np
+from datetime import datetime
+from email.mime.base import MIMEBase
+from email import encoders
 
 # ==================== EMAIL CONFIGURATION ====================
 EMAIL_CONFIG = {
@@ -30,6 +33,12 @@ EMAIL_CONFIG = {
     'smtp_port': 587,
     'sender_email': 'tasleemanasreenshaik09@gmail.com',  # Change this to your email
     'sender_password': 'cjrw frib xssk lwsd'   # Change this to your app password
+}
+
+# ==================== SECURITY CONFIGURATION ====================
+SECURITY_CONFIG = {
+    'max_decryption_attempts': 2,  # Number of wrong attempts before sending alert
+    'alert_cooldown_minutes': 3,  # Cooldown period between alerts for same folder
 }
 
 # ==================== PATH MANAGEMENT ====================
@@ -90,13 +99,36 @@ class DatabaseManager:
                 )
             ''')
             
+            # New table for decryption attempts tracking
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS decryption_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    folder_path TEXT NOT NULL,
+                    attempt_time TEXT NOT NULL,
+                    success INTEGER DEFAULT 0,
+                    ip_address TEXT,
+                    alert_sent INTEGER DEFAULT 0
+                )
+            ''')
+            
+            # New table for alert cooldown
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS alert_cooldown (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    folder_path TEXT NOT NULL,
+                    last_alert_time TEXT NOT NULL
+                )
+            ''')
+            
             conn.commit()
             conn.close()
             print("✅ Database initialized successfully")
             
         except Exception as e:
-            print(f"❌ Database initialization failed: {e}")
-    
+            print(f"❌ Database initialization failed: {e}")    
+
     def register_user(self, username, email, password, security_question, security_answer):
         """Register a new user"""
         try:
@@ -320,6 +352,147 @@ class DatabaseManager:
             print(f"Error marking token as used: {e}")
             return False
         
+    def record_decryption_attempt(self, username, folder_path, success=False):
+        """Record a decryption attempt in the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO decryption_attempts (username, folder_path, attempt_time, success)
+                VALUES (?, ?, ?, ?)
+            ''', (username, folder_path, datetime.now().isoformat(), 1 if success else 0))
+            
+            conn.commit()
+            conn.close()
+            print(f"📝 Recorded decryption attempt: {username}, {folder_path}, success: {success}")
+            return True
+        except Exception as e:
+            print(f"❌ Error recording decryption attempt: {e}")
+            return False
+        
+            # ==================== DECRYPTION ATTEMPTS TRACKING ====================
+    def get_recent_failed_attempts(self, username, folder_path, minutes=60):
+        """Get number of failed decryption attempts in the last specified minutes"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Calculate time threshold correctly using timedelta
+            time_threshold = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+            
+            print(f"🔍 Querying failed attempts for {username} since {time_threshold}")
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM decryption_attempts 
+                WHERE username = ? AND folder_path = ? AND success = 0 
+                AND attempt_time > ?
+            ''', (username, folder_path, time_threshold))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            count = result[0] if result else 0
+            print(f"🔍 Failed attempts for {username}: {count} in last {minutes} minutes")
+            return count
+            
+        except Exception as e:
+            print(f"❌ Error getting failed attempts: {e}")
+            return 0
+
+        
+    def should_send_alert(self, username, folder_path):
+        """Check if an alert should be sent for suspicious activity"""
+        try:
+            print(f"🔍 Checking alert conditions for {username}, folder: {folder_path}")
+            
+            # Check if we're in cooldown period
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT last_alert_time FROM alert_cooldown 
+                WHERE username = ? AND folder_path = ?
+            ''', (username, folder_path))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                last_alert_time = datetime.fromisoformat(result[0])
+                cooldown_minutes = SECURITY_CONFIG['alert_cooldown_minutes']
+                time_diff = (datetime.now() - last_alert_time).total_seconds() / 60
+                
+                print(f"⏰ Last alert: {last_alert_time}, Time diff: {time_diff:.1f} minutes, Cooldown: {cooldown_minutes} minutes")
+                
+                if time_diff < cooldown_minutes:
+                    conn.close()
+                    print("🚫 Still in cooldown period - no alert sent")
+                    return False
+
+            # Check failed attempts
+            failed_attempts = self.get_recent_failed_attempts(username, folder_path, minutes=60)
+            max_attempts = SECURITY_CONFIG['max_decryption_attempts']
+            
+            print(f"📊 Failed attempts: {failed_attempts}, Threshold: {max_attempts}")
+            
+            conn.close()
+            
+            if failed_attempts >= max_attempts:
+                print("🚨 ALERT CONDITION MET - Should send security alert!")
+                return True
+            else:
+                print("✅ Below threshold - no alert needed")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error checking alert condition: {e}")
+            return False
+            
+    def mark_alert_sent(self, username, folder_path):
+        """Mark that an alert has been sent for this folder"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+                
+            current_time = datetime.now().isoformat()
+                
+                # Update or insert cooldown record
+            cursor.execute('''
+                INSERT OR REPLACE INTO alert_cooldown (username, folder_path, last_alert_time)
+                VALUES (?, ?, ?)
+            ''', (username, folder_path, current_time))
+
+            # Mark attempts as alerted
+            cursor.execute('''
+                UPDATE decryption_attempts 
+                SET alert_sent = 1 
+                WHERE username = ? AND folder_path = ? AND alert_sent = 0
+            ''', (username, folder_path))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error marking alert sent: {e}")
+            return False
+
+    def get_user_by_email_from_username(self, username):
+        """Get user email by username"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT username, email FROM users WHERE username = ?", (username,))
+            result = cursor.fetchone()
+            
+            conn.close()
+            return result
+        except Exception as e:  # ← WRONG INDENTATION
+            print(f"Error getting user by username: {e}")
+            return None
+        
+
+        
     def _assess_password_strength(self, password):
         """Assess password strength (similar to PasswordManager method)"""
         if not password:
@@ -363,6 +536,38 @@ class DatabaseManager:
             return score, "Medium strength"
         else:
             return score, f"Weak: Add {', '.join(feedback[:2])}"
+        
+    def record_security_capture(self, username, folder_path, photo_path, attempt_number):
+        """Record security photo capture in database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Create table if not exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS security_captures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    folder_path TEXT NOT NULL,
+                    photo_path TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    capture_time TEXT NOT NULL
+                )
+            ''')
+            
+            # Insert capture record
+            cursor.execute('''
+                INSERT INTO security_captures (username, folder_path, photo_path, attempt_number, capture_time)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (username, folder_path, photo_path, attempt_number, datetime.now().isoformat()))
+            
+            conn.commit()
+            conn.close()
+            print(f"📸 Security capture recorded: {username}, attempt {attempt_number}")
+            return True
+        except Exception as e:
+            print(f"❌ Error recording security capture: {e}")
+            return False 
 
 # ==================== AUTHENTICATION MANAGER ====================
 class AuthManager:
@@ -370,6 +575,26 @@ class AuthManager:
         self.db = DatabaseManager()
         self.current_user = None
         self.login_callback = None
+        self.photo_manager = PhotoCaptureManager()  # Add this line
+
+    def record_failed_decryption_with_photo(self, username, folder_path, attempt_number):
+        """Record failed decryption attempt with photo capture"""
+        try:
+            # Capture photo
+            photo_path = self.photo_manager.capture_photo(username, folder_path, attempt_number)
+            
+            # Record in database
+            if photo_path:
+                self.db.record_security_capture(username, folder_path, photo_path, attempt_number)
+                print(f"📸 Security photo captured for attempt {attempt_number}")
+            
+            # Record the attempt
+            self.record_decryption_attempt(username, folder_path, success=False)
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error recording failed attempt with photo: {e}")
+            return False
     
     def set_login_callback(self, callback):
         """Set callback function to be called after successful login"""
@@ -552,6 +777,143 @@ Supraja Technologies
             return False, "Password must be at least 6 characters"
         
         return self.reset_password_with_token(token, new_password)
+        # ==================== SECURITY ALERT SYSTEM ====================
+    
+    def record_decryption_attempt(self, username, folder_path, success=False):
+        """Record a decryption attempt"""
+        return self.db.record_decryption_attempt(username, folder_path, success)
+
+    def check_and_send_security_alert(self, username, folder_path):
+        """Check if security alert should be sent and send it"""
+        try:
+            # FIX: Remove the extra ')' and fix the method call
+            if not self.db.should_send_alert(username, folder_path):
+                return False, "No alert needed"
+            
+            # Get user email
+            user_data = self.db.get_user_by_email_from_username(username)
+            if not user_data:
+                return False, "User not found"
+            
+            email = user_data[1]  # email is at index 1
+            
+            # Send security alert
+            success, message = self._send_security_alert_email(email, username, folder_path)
+            if success:
+                # Mark alert as sent
+                self.db.mark_alert_sent(username, folder_path)
+                return True, "Security alert sent successfully"
+            else:
+                return False, message
+                
+        except Exception as e:
+            return False, f"Failed to send security alert: {str(e)}"  
+        
+
+    def _send_security_alert_email(self, email, username, folder_path):
+        """Send security alert email with attached photos"""
+        recent_captures = []
+        try:
+            if (EMAIL_CONFIG['sender_email'] == 'your-email@gmail.com' or 
+                EMAIL_CONFIG['sender_password'] == 'your-app-password'):
+                return False, "Email credentials not configured"
+            
+            # Get recent security captures
+            recent_captures = self.photo_manager.get_recent_captures(username, limit=3)
+            
+            alert_message = f"""
+    SECURITY ALERT - Multiple Failed Decryption Attempts
+
+    Dear {username},
+
+    We detected multiple failed decryption attempts on your encrypted folder.
+
+    Details:
+    • Username: {username}
+    • Folder: {os.path.basename(folder_path)}
+    • Location: {folder_path}
+    • Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    • Attempts: {SECURITY_CONFIG['max_decryption_attempts']} failed attempts
+
+    This could indicate:
+    • Someone is trying to access your encrypted files without authorization
+    • You may have forgotten the correct password
+    • Potential security breach attempt
+
+    RECOMMENDED ACTIONS:
+    1. If this was you, please ensure you're using the correct password
+    2. If you suspect unauthorized access, consider:
+    - Changing your account password
+    - Moving the encrypted folder to a more secure location
+    - Monitoring for other suspicious activities
+    3. Contact support if you need assistance
+
+    If you did not attempt to decrypt this folder, please take immediate action to secure your account.
+
+    Stay secure,
+    Secure Folder Encryption Team
+    Supraja Technologies
+    """
+            
+            # Create message
+            msg = MIMEMultipart()
+            msg['From'] = EMAIL_CONFIG['sender_email']
+            msg['To'] = email
+            msg['Subject'] = "🚨 SECURITY ALERT: Multiple Failed Decryption Attempts"
+            msg.attach(MIMEText(alert_message, 'plain'))
+            
+            # Attach security photos if available
+            photos_attached = 0
+            if recent_captures:
+                for i, photo_path in enumerate(recent_captures, 1):
+                    try:
+                        if os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
+                            with open(photo_path, 'rb') as f:
+                                img_data = f.read()
+                            
+                            # Create attachment
+                            attachment = MIMEBase('application', 'octet-stream')
+                            attachment.set_payload(img_data)
+                            encoders.encode_base64(attachment)
+                            attachment.add_header(
+                                'Content-Disposition',
+                                f'attachment; filename=security_capture_{i}.jpg'
+                            )
+                            msg.attach(attachment)
+                            photos_attached += 1
+                            print(f"✅ Attached security photo: {os.path.basename(photo_path)}")
+                        else:
+                            print(f"⚠️ Photo not found or empty: {photo_path}")
+                            
+                    except Exception as e:
+                        print(f"❌ Failed to attach photo {photo_path}: {e}")
+                        continue
+            
+            print(f"📎 Total photos attached: {photos_attached}")
+            
+            # Send email
+            server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+            server.starttls()
+            server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
+            server.sendmail(EMAIL_CONFIG['sender_email'], email, msg.as_string())
+            server.quit()
+            
+            print(f"✅ Security alert with {photos_attached} photos sent to {email}")
+            return True, "Security alert sent successfully"
+            
+        except Exception as e:
+            error_msg = f"Failed to send security alert email: {str(e)}"
+            print(f"❌ {error_msg}")
+            return False, error_msg
+        
+        finally:
+            # Clean up old captures regardless of email success/failure
+            try:
+                if recent_captures:
+                    self.photo_manager.cleanup_old_captures(username, keep_count=5)
+                    print("🧹 Cleaned up old security captures")
+            except Exception as cleanup_error:
+                print(f"⚠️ Error during cleanup: {cleanup_error}")
 
 # ==================== ASSET MANAGER ====================
 class AssetManager:
@@ -699,6 +1061,102 @@ class AssetManager:
         except Exception as e:
             print(f"❌ Failed to create default logo: {e}")
             return None
+        
+# ==================== PHOTO CAPTURE MANAGER ====================
+class PhotoCaptureManager:
+    def __init__(self):
+        self.captures_dir = os.path.join(BASE_PATH, "security_captures")
+        os.makedirs(self.captures_dir, exist_ok=True)
+    
+    def capture_photo(self, username, folder_path, attempt_number):
+        """Capture photo using webcam when wrong password is entered"""
+        try:
+            # Initialize webcam
+            cap = cv2.VideoCapture(0)
+            
+            if not cap.isOpened():
+                print("❌ Webcam not accessible")
+                return None
+            
+            # Set higher resolution for better quality
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            
+            # Allow camera to initialize
+            time.sleep(1)
+            
+            # Capture multiple frames and use the clearest one
+            best_frame = None
+            max_focus = 0
+            
+            for _ in range(5):  # Capture 5 frames
+                ret, frame = cap.read()
+                if ret:
+                    # Calculate focus measure (variance of Laplacian)
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    focus = cv2.Laplacian(gray, cv2.CV_64F).var()
+                    
+                    if focus > max_focus:
+                        max_focus = focus
+                        best_frame = frame
+            
+            if best_frame is not None:
+                # Generate filename
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"security_capture_{username}_{timestamp}_attempt{attempt_number}.jpg"
+                filepath = os.path.join(self.captures_dir, filename)
+                
+                # Save the image with good quality
+                cv2.imwrite(filepath, best_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                print(f"✅ Security photo captured: {filepath}")
+                
+                # Release camera
+                cap.release()
+                cv2.destroyAllWindows()
+                
+                return filepath
+            else:
+                print("❌ Failed to capture clear photo")
+                cap.release()
+                return None
+                
+        except Exception as e:
+            print(f"❌ Photo capture error: {e}")
+            return None
+    def get_recent_captures(self, username, limit=5):
+        """Get recent security captures for a user"""
+        try:
+            captures = []
+            if not os.path.exists(self.captures_dir):
+                print(f"⚠️ Captures directory doesn't exist: {self.captures_dir}")
+                return []
+                
+            for file in os.listdir(self.captures_dir):
+                if file.startswith(f"security_capture_{username}"):
+                    filepath = os.path.join(self.captures_dir, file)
+                    if os.path.exists(filepath):
+                        captures.append((filepath, os.path.getctime(filepath)))
+            
+            # Sort by creation time (newest first)
+            captures.sort(key=lambda x: x[1], reverse=True)
+            result = [capture[0] for capture in captures[:limit]]
+            print(f"📸 Found {len(result)} recent captures for {username}")
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error getting captures: {e}")
+            return []
+    
+    def cleanup_old_captures(self, username, keep_count=10):
+        """Clean up old security captures to save space"""
+        try:
+            captures = self.get_recent_captures(username, limit=100)  # Get all captures
+            if len(captures) > keep_count:
+                for old_capture in captures[keep_count:]:
+                    os.remove(old_capture)
+                    print(f"🧹 Cleaned up old capture: {os.path.basename(old_capture)}")
+        except Exception as e:
+            print(f"❌ Error cleaning up captures: {e}")
 
 # ==================== LOGGING SYSTEM ====================
 class EncryptionLogger:
@@ -1458,7 +1916,8 @@ class FolderEncryptorGUI:
     def __init__(self, root, auth_manager):
         self.root = root
         self.auth_manager = auth_manager
-        
+        self.db = auth_manager.db
+
         # Check authentication
         current_user = self.auth_manager.get_current_user()
         print(f"🔍 User authenticated: {current_user}")
@@ -1657,6 +2116,8 @@ class FolderEncryptorGUI:
                                 command=self.decrypt_window)
         decrypt_btn.grid(row=1, column=0, padx=8, pady=6)
         self._add_hover(decrypt_btn, normal_bg="#2a9d8f", hover_bg="#45b7a8")
+
+        # Retrieve Password Button
 
         foot = tk.Label(container, text="Tip: Use strong passphrases & test on copies.",
                         font=("Segoe UI", 8), fg=theme["text_muted"], bg=panel_bg)
@@ -2019,6 +2480,89 @@ th {{
         encrypt_btn.pack(pady=10)
         self._add_hover(encrypt_btn, normal_bg="#3a6ea5", hover_bg="#558cc9")
 
+    def decrypt_window(self):
+        """Create the decryption window"""
+        self.decrypt_win = tk.Toplevel(self.root)
+        self.decrypt_win.title("Decrypt Folder")
+        self.decrypt_win.geometry("500x500")
+        self.decrypt_win.configure(bg="#f0f0f0")
+        self.decrypt_win.resizable(False, False)
+        
+        self.decrypt_win.transient(self.root)
+        self.decrypt_win.grab_set()
+        
+        main_frame = tk.Frame(self.decrypt_win, bg="#f0f0f0", padx=20, pady=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        title = tk.Label(main_frame, text="Folder Decryption", font=("Segoe UI", 16, "bold"), 
+                        bg="#f0f0f0", fg="#2c3e50")
+        title.pack(pady=(0, 15))
+
+        # Folder selection
+        folder_frame = tk.Frame(main_frame, bg="#f0f0f0")
+        folder_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Label(folder_frame, text="Select Encrypted Folder:", bg="#f0f0f0", 
+                font=("Segoe UI", 10)).pack(anchor="w")
+        
+        entry_frame = tk.Frame(folder_frame, bg="#f0f0f0")
+        entry_frame.pack(fill=tk.X, pady=5)
+        
+        self.decrypt_folder_entry = tk.Entry(entry_frame, width=50, font=("Segoe UI", 10))
+        self.decrypt_folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        browse_btn = tk.Button(entry_frame, text="Browse", command=self.browse_decrypt_folder, 
+                            bg="#2a9d8f", fg="white", font=("Segoe UI", 9), width=10)
+        browse_btn.pack(side=tk.RIGHT)
+        self._add_hover(browse_btn, normal_bg="#2a9d8f", hover_bg="#45b7a8")
+
+        # Password entry
+        password_frame = tk.Frame(main_frame, bg="#f0f0f0")
+        password_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Label(password_frame, text="Decryption Password:", bg="#f0f0f0", 
+                font=("Segoe UI", 10)).pack(anchor="w")
+        
+        self.password_entry = tk.Entry(password_frame, width=50, show="*", font=("Segoe UI", 10))
+        self.password_entry.pack(fill=tk.X, pady=5)
+        self.password_entry.bind('<KeyRelease>', self._update_decrypt_password_strength)
+
+        # Password strength indicator
+        strength_frame = tk.Frame(main_frame, bg="#f0f0f0")
+        strength_frame.pack(fill=tk.X, pady=5)
+        
+        self.decrypt_strength_label = tk.Label(strength_frame, text="Password strength: Not assessed", 
+                                            bg="#f0f0f0", font=("Segoe UI", 9))
+        self.decrypt_strength_label.pack(anchor="w")
+
+        # Show password checkbox
+        self.show_password = tk.BooleanVar()
+        show_pass_check = tk.Checkbutton(main_frame, text="Show password", variable=self.show_password,
+                                        bg="#f0f0f0", font=("Segoe UI", 9),
+                                        command=self.toggle_password_visibility)
+        show_pass_check.pack(anchor="w", pady=(0, 10))
+
+        # Progress bar with label
+        progress_frame = tk.Frame(main_frame, bg="#f0f0f0")
+        progress_frame.pack(fill=tk.X, pady=15)
+        
+        self.decrypt_progress_label = tk.Label(progress_frame, text="Ready to decrypt...", bg="#f0f0f0", 
+                                            font=("Segoe UI", 9), fg="#666666")
+        self.decrypt_progress_label.pack(anchor="w", pady=(0, 5))
+        
+        self.decrypt_progress = ttk.Progressbar(progress_frame, mode='determinate')
+        self.decrypt_progress.pack(fill=tk.X)
+
+        # Decrypt button
+        decrypt_btn = tk.Button(main_frame, text="Decrypt Folder", bg="#2a9d8f", fg="white",
+                font=("Segoe UI", 11, "bold"), height=2, width=20,
+                command=self.start_decryption)
+        decrypt_btn.pack(pady=10)
+        self._add_hover(decrypt_btn, normal_bg="#2a9d8f", hover_bg="#45b7a8")
+
+        # Set focus to first field
+        self.decrypt_folder_entry.focus_set()
+
     def browse_encrypt_folder(self):
         folder_selected = filedialog.askdirectory(title="Select Folder to Encrypt")
         if folder_selected:
@@ -2060,83 +2604,142 @@ th {{
         self.encrypt_win.after(100, lambda: self.encrypt_folder(folder_path, sender, smtp_pass, receiver))
 
     # ------------------- DECRYPT WINDOW ------------------- #
-    def decrypt_window(self):
-        self.decrypt_win = tk.Toplevel(self.root)
-        self.decrypt_win.title("Decrypt Folder")
-        self.decrypt_win.geometry("500x500")
-        self.decrypt_win.configure(bg="#f0f0f0")
-        self.decrypt_win.resizable(False, False)
-        
-        self.decrypt_win.transient(self.root)
-        self.decrypt_win.grab_set()
-        
-        main_frame = tk.Frame(self.decrypt_win, bg="#f0f0f0", padx=20, pady=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+    def decrypt_folder(self, folder_path, password):
+        try:
+            current_user = self.auth_manager.get_current_user()
+            
+            # Record decryption attempt (initially as failed)
+            self.auth_manager.record_decryption_attempt(current_user, folder_path, success=False)
+            
+            self.logger.log_decryption_attempt(folder_path, False)  # Start as not successful
+            
+            print(f"\n=== FOLDER DECRYPTION STARTED ===")
+            print(f"Encrypted folder: {folder_path}")
+            
+            # Update progress
+            self.decrypt_progress['value'] = 10
+            self.decrypt_progress_label.config(text="Scanning encrypted files...")
+            self.decrypt_win.update()
+            
+            # Count encrypted files first
+            encrypted_files = []
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.endswith('.enc'):
+                        encrypted_files.append(os.path.join(root, file))
+            
+            file_count = len(encrypted_files)
+            print(f"Found {file_count} encrypted files to decrypt")
+            
+            if file_count == 0:
+                raise Exception("No encrypted files (.enc) found in the selected folder")
+            
+            # Decrypt each file individually in the folder
+            decrypted_files = 0
+            for encrypted_file_path in encrypted_files:
+                # Update progress for each file
+                progress_percent = 10 + (decrypted_files / file_count) * 80
+                self.decrypt_progress['value'] = progress_percent
+                self.decrypt_progress_label.config(text=f"Decrypting file {decrypted_files + 1} of {file_count}...")
+                self.decrypt_win.update()
+                
+                # Get the original file path (remove .enc extension)
+                original_file_path = encrypted_file_path[:-4]
+                
+                # Decrypt the file
+                self.aes_decrypt(encrypted_file_path, original_file_path, password)
+                
+                # Remove the encrypted file after successful decryption
+                os.remove(encrypted_file_path)
+                decrypted_files += 1
+            
+            # Update progress and log success
+            self.decrypt_progress['value'] = 100
+            self.decrypt_progress_label.config(text="Decryption completed successfully!")
+            self.decrypt_win.update()
+            
+            # Record successful attempt
+            self.auth_manager.record_decryption_attempt(current_user, folder_path, success=True)
+            self.logger.log_decryption_attempt(folder_path, True)
+            
+            time.sleep(1)
+            
+            # Show success message
+            self.decrypt_win.destroy()
+            
+            success_msg = f"""✅ FOLDER DECRYPTION SUCCESSFUL!
 
-        title = tk.Label(main_frame, text="Folder Decryption", font=("Segoe UI", 16, "bold"), 
-                        bg="#f0f0f0", fg="#2c3e50")
-        title.pack(pady=(0, 15))
+📁 Folder: {os.path.basename(folder_path)}
+📊 Files Decrypted: {file_count}
 
-        # Folder selection for decryption
-        folder_frame = tk.Frame(main_frame, bg="#f0f0f0")
-        folder_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(folder_frame, text="Select Encrypted Folder:", bg="#f0f0f0", 
-                font=("Segoe UI", 10)).pack(anchor="w")
-        
-        entry_frame = tk.Frame(folder_frame, bg="#f0f0f0")
-        entry_frame.pack(fill=tk.X, pady=5)
-        
-        self.decrypt_folder_entry = tk.Entry(entry_frame, width=50, font=("Segoe UI", 10))
-        self.decrypt_folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
-        browse_btn = tk.Button(entry_frame, text="Browse", command=self.browse_decrypt_folder, 
-                              bg="#3a6ea5", fg="white", font=("Segoe UI", 9), width=10)
-        browse_btn.pack(side=tk.RIGHT)
-        self._add_hover(browse_btn, normal_bg="#3a6ea5", hover_bg="#558cc9")
+📍 Location: {folder_path}
 
-        # Password entry with strength indicator
-        tk.Label(main_frame, text="Decryption Password:", bg="#f0f0f0", 
-                font=("Segoe UI", 10)).pack(anchor="w", pady=(15, 0))
-        self.password_entry = tk.Entry(main_frame, width=50, show="*", font=("Segoe UI", 10))
-        self.password_entry.pack(fill=tk.X, pady=5)
+🎉 Your folder has been successfully decrypted!
+• All encrypted files have been restored to original format
+• Encrypted files (.enc) have been removed
+• Original files are now accessible"""
 
-        # Password strength indicator
-        self.decrypt_strength_label = tk.Label(main_frame, text="Password strength: Not assessed", 
-                                              bg="#f0f0f0", font=("Segoe UI", 9))
-        self.decrypt_strength_label.pack(anchor="w", pady=2)
-        
-        # Add real-time password strength assessment
-        self.password_entry.bind('<KeyRelease>', self._update_decrypt_password_strength)
+            messagebox.showinfo("Decryption Complete", success_msg)
+            print("=== FOLDER DECRYPTION COMPLETED ===\n")
+                               
+        except Exception as e:
+            # Update the decryption attempt record to reflect failure
+            current_user = self.auth_manager.get_current_user()
+            
+            try:
+                # FIXED: Get failed attempts count for this session
+                failed_attempts = self.db.get_recent_failed_attempts(current_user, folder_path, minutes=60)
+                attempt_number = failed_attempts + 1
+                
+                print(f"🔍 Failed attempts so far: {failed_attempts}, Current attempt: {attempt_number}")
+                
+                # Capture photo on wrong password attempts
+                if "Invalid password" in str(e) or "MAC check failed" in str(e):
+                    print(f"📸 Attempting to capture photo for attempt {attempt_number}")
+                    self.auth_manager.record_failed_decryption_with_photo(current_user, folder_path, attempt_number)
+                else:
+                    self.auth_manager.record_decryption_attempt(current_user, folder_path, success=False)
+                    
+            except Exception as db_error:
+                print(f"⚠️ Database error in decryption failure handling: {db_error}")
+                # Still record the basic attempt even if database fails
+                self.auth_manager.record_decryption_attempt(current_user, folder_path, success=False)
+            
+            self.decrypt_progress['value'] = 0
+            self.decrypt_progress_label.config(text="Decryption failed!")
+            self.logger.log_error("decryption", str(e), folder_path)
+            print(f"❌ DECRYPTION ERROR: {str(e)}")
+            
+            # Check if we should send security alert
+            if "Invalid password" in str(e) or "MAC check failed" in str(e) or "corrupted" in str(e).lower():
+                print(f"🚨 Checking security alert conditions for {current_user}")
+                try:
+                    alert_sent, alert_message = self.auth_manager.check_and_send_security_alert(
+                        current_user, folder_path
+                    )
+                    
+                    if alert_sent:
+                        print("✅ Security alert sent to user email")
+                    else:
+                        print(f"ℹ️ No alert sent: {alert_message}")
+                        
+                except Exception as alert_error:
+                    print(f"❌ Error checking/sending security alert: {alert_error}")
+            
+            error_msg = f"""❌ DECRYPTION FAILED!
 
-        # Show password checkbox
-        self.show_password = tk.BooleanVar()
-        show_pass_check = tk.Checkbutton(main_frame, text="Show password", variable=self.show_password,
-                                        bg="#f0f0f0", font=("Segoe UI", 9),
-                                        command=self.toggle_password_visibility)
-        show_pass_check.pack(anchor="w", pady=5)
+Possible reasons:
+• Incorrect password
+• Files are corrupted  
+• Folder was not encrypted with this tool
 
-        # Progress bar with label
-        progress_frame = tk.Frame(main_frame, bg="#f0f0f0")
-        progress_frame.pack(fill=tk.X, pady=15)
-        
-        self.decrypt_progress_label = tk.Label(progress_frame, text="Ready to decrypt...", bg="#f0f0f0", 
-                                              font=("Segoe UI", 9), fg="#666666")
-        self.decrypt_progress_label.pack(anchor="w", pady=(0, 5))
-        
-        self.decrypt_progress = ttk.Progressbar(progress_frame, mode='determinate')
-        self.decrypt_progress.pack(fill=tk.X)
-
-        # DECRYPT BUTTON
-        button_frame = tk.Frame(main_frame, bg="#f0f0f0")
-        button_frame.pack(fill=tk.X, pady=10)
-        
-        decrypt_btn = tk.Button(button_frame, text="DECRYPT FOLDER", bg="#2a9d8f", fg="white",
-                  font=("Segoe UI", 12, "bold"), height=2, width=25,
-                  command=self.start_decryption)
-        decrypt_btn.pack(pady=10)
-        self._add_hover(decrypt_btn, normal_bg="#2a9d8f", hover_bg="#45b7a8")
-
+💡 Tips:
+• Check the password carefully
+• Make sure you're selecting the correct encrypted folder
+• Verify the folder was encrypted with this tool"""
+            
+            messagebox.showerror("Decryption Failed", error_msg)
+    
     def _update_decrypt_password_strength(self, event=None):
         password = self.password_entry.get()
         if password:
@@ -2191,6 +2794,7 @@ th {{
         # Run decryption
         self.decrypt_win.after(100, lambda: self.decrypt_folder(folder_path, password))
 
+
     # ------------------- ENCRYPTION/DECRYPTION LOGIC ------------------- #
     def encrypt_folder(self, folder_path, sender, smtp_pass, receiver):
         try:
@@ -2204,7 +2808,7 @@ th {{
             score, message = self.password_manager.assess_password_strength(password)
             if hasattr(self, 'strength_label'):
                 self.strength_label.config(text=f"Generated password: {message}", fg="#2a9d8f")
-            
+    
             print(f"=== FOLDER ENCRYPTION STARTED ===")
             print(f"Original folder: {folder_path}")
             
@@ -2299,7 +2903,12 @@ th {{
 
     def decrypt_folder(self, folder_path, password):
         try:
-            self.logger.log_decryption_attempt(folder_path, False)  # Start as not successful
+            current_user = self.auth_manager.get_current_user()
+            
+            # Record decryption attempt (initially as failed)
+            self.auth_manager.record_decryption_attempt(current_user, folder_path, success=False)
+            
+            self.logger.log_decryption_attempt(folder_path, False)
             
             print(f"\n=== FOLDER DECRYPTION STARTED ===")
             print(f"Encrypted folder: {folder_path}")
@@ -2345,6 +2954,9 @@ th {{
             self.decrypt_progress['value'] = 100
             self.decrypt_progress_label.config(text="Decryption completed successfully!")
             self.decrypt_win.update()
+            
+            # Record successful attempt
+            self.auth_manager.record_decryption_attempt(current_user, folder_path, success=True)
             self.logger.log_decryption_attempt(folder_path, True)
             
             time.sleep(1)
@@ -2354,38 +2966,74 @@ th {{
             
             success_msg = f"""✅ FOLDER DECRYPTION SUCCESSFUL!
 
-📁 Folder: {os.path.basename(folder_path)}
-📊 Files Decrypted: {file_count}
+    📁 Folder: {os.path.basename(folder_path)}
+    📊 Files Decrypted: {file_count}
 
-📍 Location: {folder_path}
+    📍 Location: {folder_path}
 
-🎉 Your folder has been successfully decrypted!
-• All encrypted files have been restored to original format
-• Encrypted files (.enc) have been removed
-• Original files are now accessible"""
+    🎉 Your folder has been successfully decrypted!
+    • All encrypted files have been restored to original format
+    • Encrypted files (.enc) have been removed
+    • Original files are now accessible"""
 
             messagebox.showinfo("Decryption Complete", success_msg)
             print("=== FOLDER DECRYPTION COMPLETED ===\n")
-                               
+            
         except Exception as e:
+            # Update the decryption attempt record to reflect failure
+            current_user = self.auth_manager.get_current_user()
+            
+            try:
+                # FIXED: Use self.db instead of self.auth_manager.db
+                failed_attempts = self.db.get_recent_failed_attempts(current_user, folder_path, minutes=60)
+                attempt_number = failed_attempts + 1
+                
+                print(f"🔍 Failed attempts so far: {failed_attempts}, Current attempt: {attempt_number}")
+                
+                # Capture photo on wrong password attempts
+                if "Invalid password" in str(e) or "MAC check failed" in str(e):
+                    print(f"📸 Attempting to capture photo for attempt {attempt_number}")
+                    self.auth_manager.record_failed_decryption_with_photo(current_user, folder_path, attempt_number)
+                else:
+                    self.auth_manager.record_decryption_attempt(current_user, folder_path, success=False)
+                    
+            except Exception as db_error:
+                print(f"⚠️ Database error in decryption failure handling: {db_error}")
+                # Still record the basic attempt even if database fails
+                self.auth_manager.record_decryption_attempt(current_user, folder_path, success=False)
+            
             self.decrypt_progress['value'] = 0
             self.decrypt_progress_label.config(text="Decryption failed!")
             self.logger.log_error("decryption", str(e), folder_path)
             print(f"❌ DECRYPTION ERROR: {str(e)}")
-            error_msg = f"Decryption failed: {str(e)}"
             
-            if "Invalid password" in str(e) or "corrupted" in str(e).lower():
-                error_msg = """❌ DECRYPTION FAILED!
+            # Check if we should send security alert
+            if "Invalid password" in str(e) or "MAC check failed" in str(e) or "corrupted" in str(e).lower():
+                print(f"🚨 Checking security alert conditions for {current_user}")
+                try:
+                    alert_sent, alert_message = self.auth_manager.check_and_send_security_alert(
+                        current_user, folder_path
+                    )
+                    
+                    if alert_sent:
+                        print("✅ Security alert sent to user email")
+                    else:
+                        print(f"ℹ️ No alert sent: {alert_message}")
+                        
+                except Exception as alert_error:
+                    print(f"❌ Error checking/sending security alert: {alert_error}")
+            
+            error_msg = f"""❌ DECRYPTION FAILED!
 
-Possible reasons:
-• Incorrect password
-• Files are corrupted  
-• Folder was not encrypted with this tool
+    Possible reasons:
+    • Incorrect password
+    • Files are corrupted  
+    • Folder was not encrypted with this tool
 
-💡 Tips:
-• Check the password carefully
-• Make sure you're selecting the correct encrypted folder
-• Verify the folder was encrypted with this tool"""
+    💡 Tips:
+    • Check the password carefully
+    • Make sure you're selecting the correct encrypted folder
+    • Verify the folder was encrypted with this tool"""
             
             messagebox.showerror("Decryption Failed", error_msg)
 
@@ -2517,8 +3165,3 @@ if __name__ == "__main__":
     print(f"🚀 Starting Secure Folder Encryption Application...")
     print(f"📁 Base Path: {BASE_PATH}")
     start_authentication()
-
-
-
-
-
