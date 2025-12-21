@@ -1,3 +1,4 @@
+
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 from PIL import Image, ImageTk, ImageDraw
@@ -3165,5 +3166,6 @@ if __name__ == "__main__":
     print(f"🚀 Starting Secure Folder Encryption Application...")
     print(f"📁 Base Path: {BASE_PATH}")
     start_authentication()
+
 
 
